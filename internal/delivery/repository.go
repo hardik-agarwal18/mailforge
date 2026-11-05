@@ -2,6 +2,7 @@ package delivery
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -188,4 +189,200 @@ func (r *Repository) MarkBounced(
 	}
 
 	return nil
+}
+
+func (r *Repository) RecordSuccess(
+	ctx context.Context,
+	job *ClaimedDelivery,
+) error {
+	return r.recordOutcome(ctx, job, "success", "delivered", 0, "")
+}
+
+func (r *Repository) RecordPermanentFailure(
+	ctx context.Context,
+	job *ClaimedDelivery,
+	smtpCode int,
+	response string,
+) error {
+	return r.recordOutcome(
+		ctx, job, "permanent_failure", "bounced", smtpCode, response,
+	)
+}
+
+func (r *Repository) RecordTemporaryFailure(
+	ctx context.Context,
+	job *ClaimedDelivery,
+	smtpCode int,
+	response string,
+) error {
+	if job.Attempts >= 10 {
+		// Retry limit reached. Stop scheduling further attempts.
+		return r.recordOutcome(
+			ctx, job, "temporary_failure", "bounced", smtpCode,
+			response+" (maximum delivery attempts reached)",
+		)
+	}
+
+	retryAfter := retryDelay(job.Attempts)
+
+	return r.recordOutcome(
+		ctx, job, "temporary_failure", "deferred", smtpCode,
+		response,
+		retryAfter,
+	)
+}
+
+func retryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+
+	delay := 30 * time.Second
+
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+
+		if delay >= time.Hour {
+			return time.Hour
+		}
+	}
+
+	return delay
+}
+
+func (r *Repository) recordOutcome(
+	ctx context.Context,
+	job *ClaimedDelivery,
+	attemptStatus string,
+	recipientStatus string,
+	smtpCode int,
+	response string,
+	retryDelays ...time.Duration,
+) error {
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin delivery outcome transaction: %w", err)
+	}
+	defer tx.Rollback(context.Background())
+
+	tag, err := tx.Exec(ctx, `
+        UPDATE recipients
+        SET
+            status = $3,
+            next_attempt_at = CASE
+                WHEN $3 = 'deferred'
+                THEN NOW() + $4::interval
+                ELSE NULL
+            END,
+            delivery_lease_until = NULL,
+            delivery_lease_token = NULL,
+            updated_at = NOW()
+        WHERE id = $1::uuid
+          AND status = 'delivering'
+          AND delivery_lease_token = $2::uuid
+    `,
+		job.RecipientID,
+		job.LeaseToken,
+		recipientStatus,
+		retryInterval(retryDelays),
+	)
+
+	if err != nil {
+		return fmt.Errorf("update recipient status: %w", err)
+	}
+
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("delivery lease lost for recipient %s", job.RecipientID)
+	}
+
+	_, err = tx.Exec(ctx, `
+        INSERT INTO delivery_attempts (
+            recipient_id,
+            attempt_number,
+            status,
+            smtp_code,
+            response,
+            attempted_at
+        )
+        VALUES ($1::uuid, $2, $3, $4, $5, NOW())
+    `,
+		job.RecipientID,
+		job.Attempts,
+		attemptStatus,
+		nullableSMTPCode(smtpCode),
+		response,
+	)
+
+	if err != nil {
+		return fmt.Errorf("insert delivery attempt: %w", err)
+	}
+
+	// Schedule the next attempt through the transactional outbox.
+	// The existing publisher will publish it when available_at is reached.
+	if recipientStatus == "deferred" {
+		payload, err := json.Marshal(map[string]string{
+			"recipient_id": job.RecipientID,
+			"message_id":   job.MessageID,
+			"email":        job.Email,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal retry event: %w", err)
+		}
+
+		_, err = tx.Exec(ctx, `
+            INSERT INTO outbox_events (
+                event_type,
+                aggregate_type,
+                aggregate_id,
+                idempotency_key,
+                payload,
+                available_at
+            )
+            VALUES (
+                'recipient.delivery_requested',
+                'recipient',
+                $1::uuid,
+                $2,
+                $3::jsonb,
+                NOW() + $4::interval
+            )
+            ON CONFLICT (idempotency_key) DO NOTHING
+        `,
+			job.RecipientID,
+			fmt.Sprintf(
+				"recipient.delivery_requested:%s:%d",
+				job.RecipientID,
+				job.Attempts+1,
+			),
+			payload,
+			retryInterval(retryDelays),
+		)
+
+		if err != nil {
+			return fmt.Errorf("schedule retry event: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delivery outcome: %w", err)
+	}
+
+	return nil
+}
+
+func retryInterval(delays []time.Duration) string {
+	if len(delays) == 0 {
+		return "0 seconds"
+	}
+
+	return delays[0].String()
+}
+
+func nullableSMTPCode(code int) any {
+	if code == 0 {
+		return nil
+	}
+
+	return code
 }

@@ -2,17 +2,22 @@ package delivery
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+
+	"mailforge/internal/outbound"
 )
 
 type Processor struct {
 	repository *Repository
+	sender     Sender
 }
 
-func NewProcessor(repository *Repository) *Processor {
+func NewProcessor(repository *Repository, sender Sender) *Processor {
 	return &Processor{
 		repository: repository,
+		sender:     sender,
 	}
 }
 
@@ -26,7 +31,6 @@ func (p *Processor) Process(
 		return fmt.Errorf("claim recipient: %w", err)
 	}
 
-	// Another worker may have already processed or claimed it.
 	if job == nil {
 		log.Printf(
 			"Recipient already processed or unavailable: %s",
@@ -35,16 +39,44 @@ func (p *Processor) Process(
 		return nil
 	}
 
-	log.Printf(
-		"Claimed recipient=%s email=%s attempts=%d message_size=%d",
-		job.RecipientID,
+	err = p.sender.Send(
+		ctx,
+		job.Sender,
 		job.Email,
-		job.Attempts,
-		len(job.RawMessage),
+		job.RawMessage,
 	)
 
-	// Actual SMTP delivery will be implemented in the next phase.
-	// Do not mark this recipient as delivered here.
+	if err == nil {
+		return p.repository.RecordSuccess(ctx, job)
+	}
 
-	return fmt.Errorf("outbound SMTP delivery not implemented yet")
+	var deliveryErr *outbound.DeliveryError
+
+	if !errors.As(err, &deliveryErr) {
+		return fmt.Errorf("unclassified delivery failure: %w", err)
+	}
+
+	log.Printf(
+		"Delivery failed: recipient=%s smtp_code=%d permanent=%t error=%v",
+		job.RecipientID,
+		deliveryErr.SMTPCode,
+		deliveryErr.Permanent,
+		deliveryErr,
+	)
+
+	if deliveryErr.Permanent {
+		return p.repository.RecordPermanentFailure(
+			ctx,
+			job,
+			deliveryErr.SMTPCode,
+			deliveryErr.Message,
+		)
+	}
+
+	return p.repository.RecordTemporaryFailure(
+		ctx,
+		job,
+		deliveryErr.SMTPCode,
+		deliveryErr.Message,
+	)
 }

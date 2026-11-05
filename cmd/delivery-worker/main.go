@@ -11,6 +11,7 @@ import (
 
 	"mailforge/internal/database"
 	"mailforge/internal/delivery"
+	"mailforge/internal/outbound"
 )
 
 func main() {
@@ -54,7 +55,10 @@ func main() {
 
 	repository := delivery.NewRepository(db)
 	consumer := delivery.NewConsumer(redisClient, "worker-1")
-	processor := delivery.NewProcessor(repository)
+
+	smtpClient := outbound.NewClient()
+
+	processor := delivery.NewProcessor(repository, smtpClient)
 
 	worker := delivery.NewWorker(consumer, processor)
 
