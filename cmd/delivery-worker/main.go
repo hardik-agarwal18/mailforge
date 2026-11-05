@@ -32,7 +32,7 @@ func main() {
 
 	db, err := database.NewPostgresPool(ctx, database.PostgresConfig{
 		DatabaseURL: databaseURL,
-		MaxConns:    10,
+		MaxConns:    20,
 		MinConns:    2,
 	})
 	if err != nil {
@@ -95,7 +95,11 @@ func main() {
 
 	processor := delivery.NewProcessor(repository, smtpClient)
 
-	worker := delivery.NewWorker(consumer, processor)
+	worker := delivery.NewWorker(
+		consumer,
+		processor,
+		3,
+	)
 
 	log.Println("MailForge delivery worker starting")
 

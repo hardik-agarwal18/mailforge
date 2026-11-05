@@ -115,7 +115,7 @@ func (c *Consumer) ClaimStale(
 			Stream:   DeliveryStream,
 			Group:    ConsumerGroup,
 			Consumer: c.consumerName,
-			MinIdle:  30 * time.Second,
+			MinIdle:  3 * time.Minute,
 			Start:    start,
 			Count:    count,
 		},
