@@ -4,28 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/smtp"
+	"strconv"
 	"strings"
-	"time"
 )
-
-type Client struct {
-	resolver *MXResolver
-	dialer   *net.Dialer
-}
-
-func NewClient() *Client {
-	return &Client{
-		resolver: NewMXResolver(),
-		dialer: &net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		},
-	}
-}
 
 func (c *Client) Send(
 	ctx context.Context,
@@ -34,6 +20,19 @@ func (c *Client) Send(
 	rawMessage []byte,
 ) error {
 
+	// Development or configured relay mode.
+	if c.config.RelayHost != "" {
+		return c.sendToHost(
+			ctx,
+			c.config.RelayHost,
+			c.config.RelayPort,
+			sender,
+			recipient,
+			rawMessage,
+		)
+	}
+
+	// Direct-to-MX mode.
 	mxRecords, err := c.resolver.Lookup(ctx, recipient)
 	if err != nil {
 		return classifyError(err)
@@ -44,16 +43,23 @@ func (c *Client) Send(
 	for _, mx := range mxRecords {
 		host := strings.TrimSuffix(mx.Host, ".")
 
-		err := c.sendToMX(ctx, host, sender, recipient, rawMessage)
+		err := c.sendToHost(
+			ctx,
+			host,
+			25,
+			sender,
+			recipient,
+			rawMessage,
+		)
+
 		if err == nil {
 			return nil
 		}
 
 		lastErr = err
 
-		// A permanent SMTP rejection is not fixed by trying
-		// another MX host for the same recipient.
-		if deliveryErr, ok := err.(*DeliveryError); ok && deliveryErr.Permanent {
+		var deliveryErr *DeliveryError
+		if errors.As(err, &deliveryErr) && deliveryErr.Permanent {
 			return deliveryErr
 		}
 	}
@@ -65,15 +71,16 @@ func (c *Client) Send(
 	return lastErr
 }
 
-func (c *Client) sendToMX(
+func (c *Client) sendToHost(
 	ctx context.Context,
 	host string,
+	port int,
 	sender string,
 	recipient string,
 	rawMessage []byte,
 ) error {
 
-	address := net.JoinHostPort(host, "25")
+	address := net.JoinHostPort(host, strconv.Itoa(port))
 
 	conn, err := c.dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
@@ -87,7 +94,7 @@ func (c *Client) sendToMX(
 
 	client, err := smtp.NewClient(conn, host)
 	if err != nil {
-		return classifyError(fmt.Errorf("SMTP greeting from %s: %w", host, err))
+		return classifyError(fmt.Errorf("SMTP greeting: %w", err))
 	}
 	defer client.Close()
 
@@ -95,17 +102,23 @@ func (c *Client) sendToMX(
 		return classifyError(fmt.Errorf("EHLO: %w", err))
 	}
 
-	// Opportunistic STARTTLS.
-	// If the remote server advertises STARTTLS but negotiation fails,
-	// we stop rather than silently downgrading to plaintext.
-	if ok, _ := client.Extension("STARTTLS"); ok {
+	hasSTARTTLS, _ := client.Extension("STARTTLS")
+
+	if c.config.RequireSTARTTLS && !hasSTARTTLS {
+		return &DeliveryError{
+			Message:   "remote server does not support required STARTTLS",
+			Permanent: false,
+		}
+	}
+
+	if hasSTARTTLS {
 		tlsConfig := &tls.Config{
 			ServerName: host,
 			MinVersion: tls.VersionTLS12,
 		}
 
 		if err := client.StartTLS(tlsConfig); err != nil {
-			return classifyError(fmt.Errorf("STARTTLS with %s: %w", host, err))
+			return classifyError(fmt.Errorf("STARTTLS: %w", err))
 		}
 	}
 
@@ -124,11 +137,11 @@ func (c *Client) sendToMX(
 
 	if _, err := io.Copy(writer, bytes.NewReader(rawMessage)); err != nil {
 		_ = writer.Close()
-		return classifyError(fmt.Errorf("write message data: %w", err))
+		return classifyError(fmt.Errorf("write message: %w", err))
 	}
 
 	if err := writer.Close(); err != nil {
-		return classifyError(fmt.Errorf("finish message data: %w", err))
+		return classifyError(fmt.Errorf("finish DATA: %w", err))
 	}
 
 	return nil

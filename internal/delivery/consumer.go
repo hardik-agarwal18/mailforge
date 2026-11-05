@@ -51,7 +51,7 @@ func (c *Consumer) Read(
 		Consumer: c.consumerName,
 		Streams:  []string{DeliveryStream, ">"},
 		Count:    count,
-		Block:    5 * 1000,
+		Block:    5 * time.Second,
 	}).Result()
 
 	if err != nil {
