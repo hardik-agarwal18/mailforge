@@ -2,9 +2,11 @@ package smtp
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
+	"mailforge/internal/message"
 	"net"
 	"strings"
 	"time"
@@ -16,11 +18,18 @@ const (
 )
 
 type Server struct {
-	Address string
+	Address         string
+	messageAcceptor MessageAcceptor
 }
 
-func NewServer(address string) *Server {
-	return &Server{Address: address}
+func NewServer(
+	address string,
+	messageAcceptor MessageAcceptor,
+) *Server {
+	return &Server{
+		Address:         address,
+		messageAcceptor: messageAcceptor,
+	}
 }
 
 func (s *Server) Start() error {
@@ -147,26 +156,58 @@ func (s *Server) handleConnection(conn net.Conn) {
 			_ = writeReply(conn,
 				"354 End data with <CRLF>.<CRLF>")
 
-			message, err := receiveMessage(reader)
+			rawMessage, err := receiveMessage(reader)
 			if err != nil {
 				_ = writeReply(conn, "552 Message too large")
 				session.ResetTransaction()
 				return
 			}
 
-			session.MessageData = message
+			session.MessageData = rawMessage
 
-			// Temporary: We have received the message,
-			// but have not persisted or delivered it yet.
+			ctx, cancel := context.WithTimeout(
+				context.Background(),
+				10*time.Second,
+			)
+
+			stored, err := s.messageAcceptor.Accept(
+				ctx,
+				message.NewMessage{
+					Sender:     session.Sender,
+					Recipients: session.Recipients,
+					RawMessage: session.MessageData,
+				},
+			)
+
+			cancel()
+
+			if err != nil {
+				log.Printf("Message persistence failed: %v", err)
+
+				session.ResetTransaction()
+
+				_ = writeReply(
+					conn,
+					"451 4.3.0 Temporary message storage failure",
+				)
+				continue
+			}
+
 			log.Printf(
-				"Received message from %s for %v (%d bytes)",
-				session.Sender,
-				session.Recipients,
-				len(message),
+				"Message persisted: ID=%s Message-ID=%s",
+				stored.ID,
+				stored.MessageID,
 			)
 
 			session.ResetTransaction()
-			_ = writeReply(conn, "451 Message not persisted yet")
+
+			_ = writeReply(
+				conn,
+				fmt.Sprintf(
+					"250 2.0.0 Message accepted: %s",
+					stored.MessageID,
+				),
+			)
 
 		case "RSET":
 			if session.State == StateConnected ||
