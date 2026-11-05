@@ -20,15 +20,18 @@ const (
 type Server struct {
 	Address         string
 	messageAcceptor MessageAcceptor
+	metrics         MetricsRecorder
 }
 
 func NewServer(
 	address string,
 	messageAcceptor MessageAcceptor,
+	metrics MetricsRecorder,
 ) *Server {
 	return &Server{
 		Address:         address,
 		messageAcceptor: messageAcceptor,
+		metrics:         metrics,
 	}
 }
 
@@ -53,6 +56,11 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
+	if s.metrics != nil {
+		s.metrics.RecordConnectionOpened()
+		defer s.metrics.RecordConnectionClosed()
+	}
+
 	defer conn.Close()
 
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Minute))
@@ -156,8 +164,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 			_ = writeReply(conn,
 				"354 End data with <CRLF>.<CRLF>")
 
+			submissionStarted := time.Now()
+
 			rawMessage, err := receiveMessage(reader)
+
 			if err != nil {
+				if s.metrics != nil {
+					s.metrics.RecordSubmission(
+						time.Since(submissionStarted),
+						false,
+					)
+				}
+
 				_ = writeReply(conn, "552 Message too large")
 				session.ResetTransaction()
 				return
@@ -180,6 +198,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 			)
 
 			cancel()
+
+			if s.metrics != nil {
+				s.metrics.RecordSubmission(
+					time.Since(submissionStarted),
+					err == nil,
+				)
+			}
 
 			if err != nil {
 				log.Printf("Message persistence failed: %v", err)

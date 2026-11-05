@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -14,6 +16,7 @@ import (
 
 	"mailforge/internal/database"
 	"mailforge/internal/delivery"
+	"mailforge/internal/observability"
 	"mailforge/internal/outbound"
 )
 
@@ -58,8 +61,59 @@ func main() {
 		log.Fatalf("Redis connection failed: %v", err)
 	}
 
+	metrics := observability.NewMetrics()
+	metricsAddr := os.Getenv("METRICS_ADDR")
+	if metricsAddr == "" {
+		metricsAddr = "127.0.0.1:9091"
+	}
+
+	metricsServer := &http.Server{
+		Addr:              metricsAddr,
+		Handler:           metrics.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		log.Printf(
+			"Delivery worker metrics listening on %s",
+			metricsAddr,
+		)
+
+		if err := metricsServer.ListenAndServe(); err != nil &&
+			err != http.ErrServerClosed {
+			log.Printf("Metrics server failed: %v", err)
+		}
+	}()
+
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cancel()
+
+		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Metrics server shutdown failed: %v", err)
+		}
+	}()
+
 	repository := delivery.NewRepository(db)
-	consumer := delivery.NewConsumer(redisClient, "worker-1")
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+
+	consumerName := fmt.Sprintf(
+		"%s-%d",
+		hostname,
+		os.Getpid(),
+	)
+
+	consumer := delivery.NewConsumer(
+		redisClient,
+		consumerName,
+	)
 
 	smtpClient := outbound.NewClient()
 
@@ -93,12 +147,17 @@ func main() {
 		log.Println("Using direct MX delivery")
 	}
 
-	processor := delivery.NewProcessor(repository, smtpClient)
+	processor := delivery.NewProcessor(
+		repository,
+		smtpClient,
+		metrics,
+	)
 
 	worker := delivery.NewWorker(
 		consumer,
 		processor,
 		3,
+		metrics,
 	)
 
 	log.Println("MailForge delivery worker starting")

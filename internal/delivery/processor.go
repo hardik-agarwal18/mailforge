@@ -5,20 +5,33 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
+	"mailforge/internal/observability"
 	"mailforge/internal/outbound"
 )
 
 type Processor struct {
 	repository *Repository
 	sender     Sender
+	metrics    *observability.Metrics
 }
 
-func NewProcessor(repository *Repository, sender Sender) *Processor {
-	return &Processor{
+func NewProcessor(
+	repository *Repository,
+	sender Sender,
+	metrics ...*observability.Metrics,
+) *Processor {
+	processor := &Processor{
 		repository: repository,
 		sender:     sender,
 	}
+
+	if len(metrics) > 0 {
+		processor.metrics = metrics[0]
+	}
+
+	return processor
 }
 
 func (p *Processor) Process(
@@ -39,6 +52,8 @@ func (p *Processor) Process(
 		return nil
 	}
 
+	// Measure the actual SMTP operation.
+	startedAt := time.Now()
 	err = p.sender.Send(
 		ctx,
 		job.Sender,
@@ -46,7 +61,17 @@ func (p *Processor) Process(
 		job.RawMessage,
 	)
 
+	duration := time.Since(startedAt)
+
+	// SMTP succeeded.
 	if err == nil {
+		if p.metrics != nil {
+			p.metrics.RecordDeliveryAttempt(
+				duration,
+				"success",
+			)
+		}
+
 		return p.repository.RecordSuccess(ctx, job)
 	}
 
@@ -64,12 +89,28 @@ func (p *Processor) Process(
 		deliveryErr,
 	)
 
+	// Permanent SMTP failure.
 	if deliveryErr.Permanent {
+		if p.metrics != nil {
+			p.metrics.RecordDeliveryAttempt(
+				duration,
+				"permanent_failure",
+			)
+		}
+
 		return p.repository.RecordPermanentFailure(
 			ctx,
 			job,
 			deliveryErr.SMTPCode,
 			deliveryErr.Message,
+		)
+	}
+
+	// Temporary SMTP failure.
+	if p.metrics != nil {
+		p.metrics.RecordDeliveryAttempt(
+			duration,
+			"temporary_failure",
 		)
 	}
 

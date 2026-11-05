@@ -3,29 +3,39 @@ package delivery
 import (
 	"context"
 	"log"
+	"mailforge/internal/observability"
 	"sync"
+	"time"
 )
 
 type Worker struct {
 	consumer    *Consumer
 	processor   *Processor
 	concurrency int
+	metrics     *observability.Metrics
 }
 
 func NewWorker(
 	consumer *Consumer,
 	processor *Processor,
 	concurrency int,
+	metrics ...*observability.Metrics,
 ) *Worker {
 	if concurrency < 1 {
 		concurrency = 1
 	}
 
-	return &Worker{
+	worker := &Worker{
 		consumer:    consumer,
 		processor:   processor,
 		concurrency: concurrency,
 	}
+
+	if len(metrics) > 0 {
+		worker.metrics = metrics[0]
+	}
+
+	return worker
 }
 
 func (w *Worker) Run(ctx context.Context) error {
@@ -115,7 +125,27 @@ func (w *Worker) processJob(
 	ctx context.Context,
 	job DeliveryJob,
 ) {
+	startedAt := time.Now()
+
+	if w.metrics != nil {
+		w.metrics.DeliveryJobsActive.Inc()
+
+		defer w.metrics.DeliveryJobsActive.Dec()
+
+		defer func() {
+			w.metrics.DeliveryJobDuration.Observe(
+				time.Since(startedAt).Seconds(),
+			)
+		}()
+	}
+
 	if err := w.processor.Process(ctx, job); err != nil {
+		if w.metrics != nil {
+			w.metrics.DeliveryJobsTotal.
+				WithLabelValues("processing_error").
+				Inc()
+		}
+
 		log.Printf(
 			"Processing failed: event=%s error=%v",
 			job.EventID,
@@ -125,6 +155,12 @@ func (w *Worker) processJob(
 	}
 
 	if err := w.consumer.Acknowledge(ctx, job.EventID); err != nil {
+		if w.metrics != nil {
+			w.metrics.DeliveryJobsTotal.
+				WithLabelValues("acknowledgement_error").
+				Inc()
+		}
+
 		log.Printf(
 			"Acknowledgement failed: event=%s error=%v",
 			job.EventID,
@@ -133,8 +169,11 @@ func (w *Worker) processJob(
 		return
 	}
 
-	log.Printf(
-		"Acknowledged event %s",
-		job.EventID,
-	)
+	if w.metrics != nil {
+		w.metrics.DeliveryJobsTotal.
+			WithLabelValues("acknowledged").
+			Inc()
+	}
+
+	log.Printf("Acknowledged event %s", job.EventID)
 }
