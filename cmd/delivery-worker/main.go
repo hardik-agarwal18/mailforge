@@ -9,24 +9,11 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"mailforge/internal/database"
 	"mailforge/internal/delivery"
 )
 
 func main() {
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "127.0.0.1:6379"
-	}
-
-	redisPassword := os.Getenv("REDIS_PASSWORD")
-
-	client := redis.NewClient(&redis.Options{
-		Addr:     redisAddr,
-		Password: redisPassword,
-		DB:       0,
-	})
-	defer client.Close()
-
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -34,16 +21,46 @@ func main() {
 	)
 	defer stop()
 
-	if err := client.Ping(ctx).Err(); err != nil {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL is required")
+	}
+
+	db, err := database.NewPostgresPool(ctx, database.PostgresConfig{
+		DatabaseURL: databaseURL,
+		MaxConns:    10,
+		MinConns:    2,
+	})
+	if err != nil {
+		log.Fatalf("PostgreSQL connection failed: %v", err)
+	}
+	defer db.Close()
+
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "127.0.0.1:6379"
+	}
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     redisAddr,
+		Password: os.Getenv("REDIS_PASSWORD"),
+		DB:       0,
+	})
+	defer redisClient.Close()
+
+	if err := redisClient.Ping(ctx).Err(); err != nil {
 		log.Fatalf("Redis connection failed: %v", err)
 	}
 
-	consumer := delivery.NewConsumer(client, "worker-1")
-	processor := delivery.NewProcessor()
+	repository := delivery.NewRepository(db)
+	consumer := delivery.NewConsumer(redisClient, "worker-1")
+	processor := delivery.NewProcessor(repository)
 
 	worker := delivery.NewWorker(consumer, processor)
 
+	log.Println("MailForge delivery worker starting")
+
 	if err := worker.Run(ctx); err != nil {
-		log.Fatalf("Delivery worker stopped: %v", err)
+		log.Fatalf("Worker failed: %v", err)
 	}
 }

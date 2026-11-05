@@ -8,3 +8,13 @@ type DeliveryJob struct {
 	MessageID   string `json:"message_id"`
 	Email       string `json:"email"`
 }
+
+type ClaimedDelivery struct {
+	RecipientID string
+	MessageID   string
+	Email       string
+	Sender      string
+	RawMessage  []byte
+	Attempts    int
+	LeaseToken  string
+}
