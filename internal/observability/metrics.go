@@ -25,6 +25,12 @@ type Metrics struct {
 
 	DeliveryAttemptsTotal   *prometheus.CounterVec
 	DeliveryAttemptDuration prometheus.Histogram
+
+	// Redis queue metrics
+	RedisStreamEntries    prometheus.Gauge
+	RedisConsumerGroupLag prometheus.Gauge
+	RedisPendingMessages  prometheus.Gauge
+	RedisConsumers        prometheus.Gauge
 }
 
 func NewMetrics() *Metrics {
@@ -111,6 +117,34 @@ func NewMetrics() *Metrics {
 				Buckets: prometheus.DefBuckets,
 			},
 		),
+
+		RedisStreamEntries: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "mailforge_redis_stream_entries",
+				Help: "Total number of entries currently retained in the Redis delivery stream.",
+			},
+		),
+
+		RedisConsumerGroupLag: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "mailforge_redis_consumer_group_lag",
+				Help: "Number of delivery stream entries not yet delivered to the consumer group.",
+			},
+		),
+
+		RedisPendingMessages: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "mailforge_redis_pending_messages",
+				Help: "Number of delivered but unacknowledged Redis stream messages.",
+			},
+		),
+
+		RedisConsumers: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "mailforge_redis_consumers",
+				Help: "Number of consumers registered in the delivery consumer group.",
+			},
+		),
 	}
 
 	registry.MustRegister(
@@ -124,6 +158,10 @@ func NewMetrics() *Metrics {
 		m.DeliveryJobDuration,
 		m.DeliveryAttemptsTotal,
 		m.DeliveryAttemptDuration,
+		m.RedisStreamEntries,
+		m.RedisConsumerGroupLag,
+		m.RedisPendingMessages,
+		m.RedisConsumers,
 	)
 
 	return m

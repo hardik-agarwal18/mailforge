@@ -43,6 +43,10 @@ func (w *Worker) Run(ctx context.Context) error {
 		return err
 	}
 
+	if w.metrics != nil {
+		go w.collectRedisMetrics(ctx, 5*time.Second)
+	}
+
 	log.Printf(
 		"Delivery worker started with concurrency=%d",
 		w.concurrency,
