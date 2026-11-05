@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func (w *Worker) collectRedisMetrics(
@@ -50,19 +52,62 @@ func (w *Worker) updateRedisMetrics(ctx context.Context) {
 		return
 	}
 
+	groupFound := false
+
 	for _, group := range groups {
 		if group.Name != ConsumerGroup {
 			continue
 		}
 
+		groupFound = true
+
 		w.metrics.RedisPendingMessages.Set(float64(group.Pending))
 		w.metrics.RedisConsumers.Set(float64(group.Consumers))
 
 		// Redis can report -1 when lag is unavailable.
-		w.metrics.RedisConsumerGroupLag.Set(float64(group.Lag))
+		if group.Lag >= 0 {
+			w.metrics.RedisConsumerGroupLag.Set(float64(group.Lag))
+		}
+
+		// No pending messages means no pending idle time.
+		if group.Pending == 0 {
+			w.metrics.RedisOldestPendingIdle.Set(0)
+			return
+		}
+
+		// Retrieve the oldest pending entry by stream ID.
+		pending, err := client.XPendingExt(
+			ctx,
+			&redis.XPendingExtArgs{
+				Stream: DeliveryStream,
+				Group:  ConsumerGroup,
+				Start:  "-",
+				End:    "+",
+				Count:  1,
+			},
+		).Result()
+
+		if err != nil {
+			log.Printf("Redis metrics: XPENDING failed: %v", err)
+			return
+		}
+
+		if len(pending) == 0 {
+			w.metrics.RedisOldestPendingIdle.Set(0)
+			return
+		}
+
+		w.metrics.RedisOldestPendingIdle.Set(
+			pending[0].Idle.Seconds(),
+		)
 
 		return
 	}
 
-	log.Printf("Redis metrics: consumer group %q not found", ConsumerGroup)
+	if !groupFound {
+		log.Printf(
+			"Redis metrics: consumer group %q not found",
+			ConsumerGroup,
+		)
+	}
 }

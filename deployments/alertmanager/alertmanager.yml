@@ -1,0 +1,21 @@
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: "mailpit:1025"
+  smtp_from: "mailforge-alerts@localhost"
+  smtp_hello: "mailforge"
+  smtp_require_tls: false
+
+route:
+  receiver: "mailforge-email"
+  group_by:
+    - alertname
+    - severity
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+
+receivers:
+  - name: "mailforge-email"
+    email_configs:
+      - to: "hardik.agarwal18.work@gmail.com"
+        send_resolved: true

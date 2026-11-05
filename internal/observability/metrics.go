@@ -27,10 +27,11 @@ type Metrics struct {
 	DeliveryAttemptDuration prometheus.Histogram
 
 	// Redis queue metrics
-	RedisStreamEntries    prometheus.Gauge
-	RedisConsumerGroupLag prometheus.Gauge
-	RedisPendingMessages  prometheus.Gauge
-	RedisConsumers        prometheus.Gauge
+	RedisStreamEntries     prometheus.Gauge
+	RedisConsumerGroupLag  prometheus.Gauge
+	RedisPendingMessages   prometheus.Gauge
+	RedisConsumers         prometheus.Gauge
+	RedisOldestPendingIdle prometheus.Gauge
 }
 
 func NewMetrics() *Metrics {
@@ -145,6 +146,13 @@ func NewMetrics() *Metrics {
 				Help: "Number of consumers registered in the delivery consumer group.",
 			},
 		),
+
+		RedisOldestPendingIdle: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "mailforge_redis_oldest_pending_idle_seconds",
+				Help: "Idle time of the oldest pending Redis delivery message in seconds.",
+			},
+		),
 	}
 
 	registry.MustRegister(
@@ -162,6 +170,7 @@ func NewMetrics() *Metrics {
 		m.RedisConsumerGroupLag,
 		m.RedisPendingMessages,
 		m.RedisConsumers,
+		m.RedisOldestPendingIdle,
 	)
 
 	return m

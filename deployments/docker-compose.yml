@@ -68,6 +68,7 @@ services:
       - "9093:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -88,8 +89,25 @@ services:
     depends_on:
       - prometheus
 
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: mailforge-alertmanager
+    restart: unless-stopped
+    ports:
+      - "9094:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    depends_on:
+      - prometheus
+      - mailpit
+
 volumes:
   postgres_data:
   redis_data:
   prometheus_data:
   grafana_data:
+  alertmanager_data:

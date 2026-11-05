@@ -1,0 +1,38 @@
+groups:
+  - name: mailforge-queue-alerts
+    rules:
+      - alert: MailForgeConsumerGroupLagHigh
+        expr: max(mailforge_redis_consumer_group_lag) > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MailForge delivery queue is accumulating"
+          description: "Consumer group lag has exceeded 100 messages for 2 minutes."
+
+      - alert: MailForgePendingMessagesHigh
+        expr: max(mailforge_redis_pending_messages) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Too many pending delivery messages"
+          description: "More than 10 Redis messages are pending acknowledgement."
+
+      - alert: MailForgeDeliveryStuck
+        expr: max(mailforge_redis_oldest_pending_idle_seconds) > 120
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MailForge delivery appears stuck"
+          description: "The oldest pending delivery has been idle for over 120 seconds."
+
+      - alert: MailForgeWorkerDown
+        expr: up{job=~"mailforge-delivery-worker-.*"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "MailForge delivery worker is down"
+          description: "A delivery worker metrics endpoint is unavailable."
