@@ -17,7 +17,8 @@ type Metrics struct {
 	SMTPMessagesAccepted prometheus.Counter
 	SMTPMessagesRejected prometheus.Counter
 
-	SMTPSubmissionDuration prometheus.Histogram
+	SMTPSubmissionDuration   prometheus.Histogram
+	SMTPAuthenticationsTotal *prometheus.CounterVec
 
 	DeliveryJobsTotal   *prometheus.CounterVec
 	DeliveryJobsActive  prometheus.Gauge
@@ -66,6 +67,14 @@ func NewMetrics() *Metrics {
 				Name: "mailforge_smtp_messages_rejected_total",
 				Help: "Total SMTP messages rejected.",
 			},
+		),
+
+		SMTPAuthenticationsTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "mailforge_smtp_authentications_total",
+				Help: "SMTP AUTH credential checks accepted or rejected, by outcome.",
+			},
+			[]string{"outcome"},
 		),
 
 		SMTPSubmissionDuration: prometheus.NewHistogram(
@@ -155,12 +164,16 @@ func NewMetrics() *Metrics {
 		),
 	}
 
+	m.SMTPAuthenticationsTotal.WithLabelValues("success")
+	m.SMTPAuthenticationsTotal.WithLabelValues("failure")
+
 	registry.MustRegister(
 		m.SMTPConnectionsTotal,
 		m.SMTPConnectionsActive,
 		m.SMTPMessagesAccepted,
 		m.SMTPMessagesRejected,
 		m.SMTPSubmissionDuration,
+		m.SMTPAuthenticationsTotal,
 		m.DeliveryJobsTotal,
 		m.DeliveryJobsActive,
 		m.DeliveryJobDuration,
@@ -214,4 +227,12 @@ func (m *Metrics) RecordDeliveryAttempt(
 		Inc()
 
 	m.DeliveryAttemptDuration.Observe(duration.Seconds())
+}
+
+func (m *Metrics) RecordAuthentication(success bool) {
+	outcome := "failure"
+	if success {
+		outcome = "success"
+	}
+	m.SMTPAuthenticationsTotal.WithLabelValues(outcome).Inc()
 }

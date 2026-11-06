@@ -12,8 +12,16 @@ const (
 )
 
 type Session struct {
-	State       State
-	Hostname    string
+	State     State
+	Hostname  string
+	ESMTP     bool
+	TLSActive bool
+
+	Authenticated         bool
+	AuthenticatedUsername string
+	AuthenticatedEmail    string
+	AuthFailures          int
+
 	Sender      string
 	Recipients  []string
 	MessageData []byte
@@ -34,6 +42,5 @@ func (s *Session) ResetTransaction() {
 }
 
 func (s *Session) CanReceiveRecipient() bool {
-	return s.State == StateMail ||
-		s.State == StateRecipient
+	return s.State == StateMail || s.State == StateRecipient
 }

@@ -36,6 +36,8 @@ func TestMetricsRecording(t *testing.T) {
 	m := NewMetrics()
 
 	m.RecordConnectionOpened()
+	m.RecordAuthentication(true)
+	m.RecordAuthentication(false)
 	m.RecordSubmission(100*time.Millisecond, true)
 	m.RecordSubmission(200*time.Millisecond, false)
 	m.RecordConnectionClosed()
@@ -58,6 +60,19 @@ func TestMetricsRecording(t *testing.T) {
 				t.Fatalf("got %v, want %v", got, tt.want)
 			}
 		})
+	}
+
+	authFamilies := findMetric(t, m, "mailforge_smtp_authentications_total")
+	authCounts := make(map[string]float64)
+	for _, metric := range authFamilies.GetMetric() {
+		for _, label := range metric.GetLabel() {
+			if label.GetName() == "outcome" {
+				authCounts[label.GetValue()] = metric.GetCounter().GetValue()
+			}
+		}
+	}
+	if authCounts["success"] != 1 || authCounts["failure"] != 1 {
+		t.Fatalf("authentication outcome counts = %v, want success=1 failure=1", authCounts)
 	}
 
 	active := findMetric(
