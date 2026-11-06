@@ -20,7 +20,26 @@ import (
 	"mailforge/internal/outbound"
 )
 
+const (
+	defaultRedisAddr        = "127.0.0.1:6379"
+	defaultMetricsAddr      = "127.0.0.1:9091"
+	defaultWorkerCount      = 3
+	defaultOperationTimeout = 30 * time.Second
+	defaultDeliveryTimeout  = 2 * time.Minute
+)
+
 func main() {
+	if err := run(); err != nil {
+		log.Printf("Delivery worker terminated: %v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	// --------------------------------------------------
+	// Application context and graceful shutdown
+	// --------------------------------------------------
+
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -28,25 +47,70 @@ func main() {
 	)
 	defer stop()
 
-	databaseURL := os.Getenv("DATABASE_URL")
+	// --------------------------------------------------
+	// Configuration
+	// --------------------------------------------------
+
+	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 	if databaseURL == "" {
-		log.Fatal("DATABASE_URL is required")
+		return fmt.Errorf("DATABASE_URL is required")
 	}
 
-	db, err := database.NewPostgresPool(ctx, database.PostgresConfig{
-		DatabaseURL: databaseURL,
-		MaxConns:    20,
-		MinConns:    2,
-	})
+	redisAddr := envString("REDIS_ADDR", defaultRedisAddr)
+	metricsAddr := envString("METRICS_ADDR", defaultMetricsAddr)
+
+	workerConcurrency, err := envInt(
+		"DELIVERY_WORKER_CONCURRENCY",
+		defaultWorkerCount,
+	)
 	if err != nil {
-		log.Fatalf("PostgreSQL connection failed: %v", err)
+		return err
+	}
+
+	if workerConcurrency < 1 {
+		return fmt.Errorf(
+			"DELIVERY_WORKER_CONCURRENCY must be at least 1",
+		)
+	}
+
+	operationTimeout, err := envDuration(
+		"SMTP_OPERATION_TIMEOUT",
+		defaultOperationTimeout,
+	)
+	if err != nil {
+		return err
+	}
+
+	deliveryTimeout, err := envDuration(
+		"SMTP_DELIVERY_TIMEOUT",
+		defaultDeliveryTimeout,
+	)
+	if err != nil {
+		return err
+	}
+
+	// --------------------------------------------------
+	// PostgreSQL
+	// --------------------------------------------------
+
+	db, err := database.NewPostgresPool(
+		ctx,
+		database.PostgresConfig{
+			DatabaseURL: databaseURL,
+			MaxConns:    20,
+			MinConns:    2,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("PostgreSQL connection failed: %w", err)
 	}
 	defer db.Close()
 
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "127.0.0.1:6379"
-	}
+	log.Println("PostgreSQL connected")
+
+	// --------------------------------------------------
+	// Redis
+	// --------------------------------------------------
 
 	redisClient := redis.NewClient(&redis.Options{
 		Addr:         redisAddr,
@@ -55,17 +119,24 @@ func main() {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 5 * time.Second,
 	})
-	defer redisClient.Close()
+
+	defer func() {
+		if err := redisClient.Close(); err != nil {
+			log.Printf("Redis shutdown failed: %v", err)
+		}
+	}()
 
 	if err := redisClient.Ping(ctx).Err(); err != nil {
-		log.Fatalf("Redis connection failed: %v", err)
+		return fmt.Errorf("Redis connection failed: %w", err)
 	}
 
+	log.Printf("Redis connected: %s", redisAddr)
+
+	// --------------------------------------------------
+	// Prometheus metrics server
+	// --------------------------------------------------
+
 	metrics := observability.NewMetrics()
-	metricsAddr := os.Getenv("METRICS_ADDR")
-	if metricsAddr == "" {
-		metricsAddr = "127.0.0.1:9091"
-	}
 
 	metricsServer := &http.Server{
 		Addr:              metricsAddr,
@@ -73,15 +144,18 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	metricsServerErrors := make(chan error, 1)
+
 	go func() {
 		log.Printf(
 			"Delivery worker metrics listening on %s",
 			metricsAddr,
 		)
 
-		if err := metricsServer.ListenAndServe(); err != nil &&
-			err != http.ErrServerClosed {
-			log.Printf("Metrics server failed: %v", err)
+		err := metricsServer.ListenAndServe()
+
+		if err != nil && err != http.ErrServerClosed {
+			metricsServerErrors <- err
 		}
 	}()
 
@@ -93,11 +167,22 @@ func main() {
 		defer cancel()
 
 		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
-			log.Printf("Metrics server shutdown failed: %v", err)
+			log.Printf(
+				"Metrics server shutdown failed: %v",
+				err,
+			)
 		}
 	}()
 
+	// --------------------------------------------------
+	// Delivery repository
+	// --------------------------------------------------
+
 	repository := delivery.NewRepository(db)
+
+	// --------------------------------------------------
+	// Redis consumer
+	// --------------------------------------------------
 
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -115,17 +200,22 @@ func main() {
 		consumerName,
 	)
 
-	operationTimeout := envDuration("SMTP_OPERATION_TIMEOUT", 30*time.Second)
-	deliveryTimeout := envDuration("SMTP_DELIVERY_TIMEOUT", 2*time.Minute)
-	smtpClient, err := outbound.NewClientWithConfig(outbound.Config{
+	log.Printf("Redis consumer: %s", consumerName)
+
+	// --------------------------------------------------
+	// SMTP client configuration
+	// --------------------------------------------------
+
+	smtpConfig := outbound.Config{
 		OperationTimeout: operationTimeout,
 		DeliveryTimeout:  deliveryTimeout,
-	})
-	if err != nil {
-		log.Fatalf("SMTP client configuration failed: %v", err)
 	}
 
-	relayHost := os.Getenv("SMTP_RELAY_HOST")
+	var smtpClient *outbound.Client
+
+	relayHost := strings.TrimSpace(
+		os.Getenv("SMTP_RELAY_HOST"),
+	)
 
 	if relayHost != "" {
 		relayPort := 1025
@@ -133,29 +223,58 @@ func main() {
 		if port := os.Getenv("SMTP_RELAY_PORT"); port != "" {
 			parsedPort, err := strconv.Atoi(port)
 			if err != nil {
-				log.Fatalf("Invalid SMTP_RELAY_PORT: %v", err)
+				return fmt.Errorf(
+					"invalid SMTP_RELAY_PORT: %w",
+					err,
+				)
 			}
+
+			if parsedPort < 1 || parsedPort > 65535 {
+				return fmt.Errorf(
+					"SMTP_RELAY_PORT must be between 1 and 65535",
+				)
+			}
+
 			relayPort = parsedPort
 		}
 
-		smtpClient, err = outbound.NewRelayClient(outbound.Config{
-			RelayHost:        relayHost,
-			RelayPort:        relayPort,
-			OperationTimeout: operationTimeout,
-			DeliveryTimeout:  deliveryTimeout,
-			RequireSTARTTLS: strings.EqualFold(
-				os.Getenv("SMTP_REQUIRE_STARTTLS"),
-				"true",
-			),
-		})
+		smtpConfig.RelayHost = relayHost
+		smtpConfig.RelayPort = relayPort
+		smtpConfig.RequireSTARTTLS = strings.EqualFold(
+			os.Getenv("SMTP_REQUIRE_STARTTLS"),
+			"true",
+		)
+
+		smtpClient, err = outbound.NewRelayClient(smtpConfig)
 		if err != nil {
-			log.Fatalf("SMTP relay configuration failed: %v", err)
+			return fmt.Errorf(
+				"SMTP relay configuration failed: %w",
+				err,
+			)
 		}
 
-		log.Printf("Using SMTP relay %s:%d", relayHost, relayPort)
+		log.Printf(
+			"Using SMTP relay %s:%d",
+			relayHost,
+			relayPort,
+		)
 	} else {
+		smtpClient, err = outbound.NewClientWithConfig(
+			smtpConfig,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"SMTP client configuration failed: %w",
+				err,
+			)
+		}
+
 		log.Println("Using direct MX delivery")
 	}
+
+	// --------------------------------------------------
+	// Delivery processor
+	// --------------------------------------------------
 
 	processor := delivery.NewProcessor(
 		repository,
@@ -163,28 +282,94 @@ func main() {
 		metrics,
 	)
 
+	// --------------------------------------------------
+	// Delivery worker
+	// --------------------------------------------------
+
 	worker := delivery.NewWorker(
 		consumer,
 		processor,
-		3,
+		workerConcurrency,
 		metrics,
 	)
 
-	log.Println("MailForge delivery worker starting")
+	log.Printf(
+		"Starting MailForge delivery worker: concurrency=%d smtp_timeout=%s",
+		workerConcurrency,
+		deliveryTimeout,
+	)
+
+	// --------------------------------------------------
+	// Run worker
+	// --------------------------------------------------
 
 	if err := worker.Run(ctx); err != nil {
-		log.Fatalf("Worker failed: %v", err)
+		return fmt.Errorf("delivery worker failed: %w", err)
 	}
+
+	log.Println("MailForge delivery worker stopped gracefully")
+
+	return nil
 }
 
-func envDuration(name string, fallback time.Duration) time.Duration {
-	value := os.Getenv(name)
+// --------------------------------------------------
+// Environment helpers
+// --------------------------------------------------
+
+func envString(name string, fallback string) string {
+	value := strings.TrimSpace(os.Getenv(name))
+
 	if value == "" {
 		return fallback
 	}
-	parsed, err := time.ParseDuration(value)
-	if err != nil || parsed <= 0 {
-		log.Fatalf("%s must be a positive duration (for example 30s or 2m)", name)
+
+	return value
+}
+
+func envInt(name string, fallback int) (int, error) {
+	value := os.Getenv(name)
+
+	if value == "" {
+		return fallback, nil
 	}
-	return parsed
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"%s must be an integer: %w",
+			name,
+			err,
+		)
+	}
+
+	return parsed, nil
+}
+
+func envDuration(
+	name string,
+	fallback time.Duration,
+) (time.Duration, error) {
+	value := os.Getenv(name)
+
+	if value == "" {
+		return fallback, nil
+	}
+
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"%s must be a valid duration: %w",
+			name,
+			err,
+		)
+	}
+
+	if parsed <= 0 {
+		return 0, fmt.Errorf(
+			"%s must be positive",
+			name,
+		)
+	}
+
+	return parsed, nil
 }

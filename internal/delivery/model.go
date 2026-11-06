@@ -1,9 +1,9 @@
 package delivery
 
 type DeliveryJob struct {
-	EventID     string
-	EventType   string
-	AggregateID string
+	EventID     string `json:"event_id,omitempty"`
+	EventType   string `json:"event_type,omitempty"`
+	AggregateID string `json:"aggregate_id,omitempty"`
 	RecipientID string `json:"recipient_id"`
 	MessageID   string `json:"message_id"`
 	Email       string `json:"email"`
