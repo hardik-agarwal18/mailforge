@@ -47,6 +47,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		go w.collectRedisMetrics(ctx, 5*time.Second)
 	}
 
+	// Only one worker at a time performs stream retention.
+	go w.runStreamRetention(ctx)
+
 	log.Printf(
 		"Delivery worker started with concurrency=%d",
 		w.concurrency,
@@ -73,9 +76,15 @@ func (w *Worker) Run(ctx context.Context) error {
 			log.Printf("Failed to recover pending jobs: %v", err)
 		} else {
 			claimCursor = nextCursor
+
+			if w.metrics != nil && len(staleJobs) > 0 {
+				w.metrics.RedisMessagesReclaimed.Add(
+					float64(len(staleJobs)),
+				)
+			}
+
 			w.processBatch(ctx, staleJobs)
 		}
-
 		if ctx.Err() != nil {
 			return nil
 		}

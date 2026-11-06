@@ -1,0 +1,16 @@
+services:
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.93.0
+    container_name: mailforge-redis-exporter
+    restart: unless-stopped
+
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+    expose:
+      - "9121"
+
+    depends_on:
+      redis:
+        condition: service_healthy

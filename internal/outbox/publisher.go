@@ -84,6 +84,8 @@ func (p *Publisher) publishBatch(ctx context.Context) {
 					event.ID,
 					markErr,
 				)
+			} else if event.Attempts >= 10 {
+				log.Printf("Outbox event %s moved to dead status; inspect with cmd/outbox-admin list-dead", event.ID)
 			}
 
 			continue

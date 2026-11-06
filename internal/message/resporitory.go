@@ -2,19 +2,33 @@ package message
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+var ErrSubmissionQuotaExceeded = errors.New("SMTP submission quota exceeded")
+
 type Repository struct {
-	db *pgxpool.Pool
+	db     *pgxpool.Pool
+	quotas SubmissionQuotaLimits
 }
 
 func NewRepository(db *pgxpool.Pool) *Repository {
+	// Legacy/inbound SMTP paths do not inherit authenticated submission quotas.
+	return &Repository{db: db}
+}
+
+func NewRepositoryWithQuota(db *pgxpool.Pool, quotas SubmissionQuotaLimits) *Repository {
 	return &Repository{
-		db: db,
+		db:     db,
+		quotas: normalizeSubmissionQuotaLimits(quotas),
 	}
 }
 
@@ -37,6 +51,32 @@ func (r *Repository) Create(
 	defer func() {
 		_ = tx.Rollback(context.Background())
 	}()
+
+	// Quota reservations share this transaction with message persistence. A
+	// rejected submission rolls back both counters and all message records.
+	recipientCount := len(msg.Recipients)
+	if account := strings.ToLower(strings.TrimSpace(msg.Sender)); account != "" &&
+		(r.quotas.MaxMessagesPerAccountPerHour > 0 || r.quotas.MaxRecipientsPerAccountPerHour > 0) {
+		if err := r.reserveSubmissionQuota(
+			ctx, tx, "account", quotaIdentity(account),
+			r.quotas.MaxMessagesPerAccountPerHour,
+			r.quotas.MaxRecipientsPerAccountPerHour,
+			recipientCount,
+		); err != nil {
+			return "", err
+		}
+	}
+	if clientIP := strings.TrimSpace(msg.ClientIP); clientIP != "" &&
+		(r.quotas.MaxMessagesPerIPPerHour > 0 || r.quotas.MaxRecipientsPerIPPerHour > 0) {
+		if err := r.reserveSubmissionQuota(
+			ctx, tx, "ip", quotaIdentity(clientIP),
+			r.quotas.MaxMessagesPerIPPerHour,
+			r.quotas.MaxRecipientsPerIPPerHour,
+			recipientCount,
+		); err != nil {
+			return "", err
+		}
+	}
 
 	// 1. Insert message.
 	var messageID string
@@ -144,4 +184,57 @@ func (r *Repository) Create(
 	}
 
 	return messageID, nil
+}
+
+func (r *Repository) reserveSubmissionQuota(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope string,
+	identity string,
+	maxMessages int,
+	maxRecipients int,
+	recipientCount int,
+) error {
+	var messageCount int
+	var totalRecipients int
+	err := tx.QueryRow(ctx, `
+		INSERT INTO smtp_submission_usage (
+			scope, identity, window_started_at, message_count, recipient_count, updated_at
+		)
+		VALUES ($1, $2, NOW(), 1, $3, NOW())
+		ON CONFLICT (scope, identity) DO UPDATE
+		SET
+			window_started_at = CASE
+				WHEN smtp_submission_usage.window_started_at <= NOW() - INTERVAL '1 hour'
+				THEN NOW()
+				ELSE smtp_submission_usage.window_started_at
+			END,
+			message_count = CASE
+				WHEN smtp_submission_usage.window_started_at <= NOW() - INTERVAL '1 hour'
+				THEN 1
+				ELSE smtp_submission_usage.message_count + 1
+			END,
+			recipient_count = CASE
+				WHEN smtp_submission_usage.window_started_at <= NOW() - INTERVAL '1 hour'
+				THEN EXCLUDED.recipient_count
+				ELSE smtp_submission_usage.recipient_count + EXCLUDED.recipient_count
+			END,
+			updated_at = NOW()
+		RETURNING message_count, recipient_count
+	`, scope, identity, recipientCount).Scan(&messageCount, &totalRecipients)
+	if err != nil {
+		return fmt.Errorf("reserve %s submission quota: %w", scope, err)
+	}
+	if messageCount > maxMessages {
+		return fmt.Errorf("%w: %s limit is %d messages per hour", ErrSubmissionQuotaExceeded, scope, maxMessages)
+	}
+	if totalRecipients > maxRecipients {
+		return fmt.Errorf("%w: %s limit is %d recipients per hour", ErrSubmissionQuotaExceeded, scope, maxRecipients)
+	}
+	return nil
+}
+
+func quotaIdentity(identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(sum[:])
 }

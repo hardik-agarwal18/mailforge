@@ -61,6 +61,7 @@ func (s *Service) Accept(
 	stored := StoredMessage{
 		MessageID:   fmt.Sprintf("<%s@%s>", uuid.NewString(), messageDomain),
 		Sender:      input.Sender,
+		ClientIP:    input.ClientIP,
 		Recipients:  input.Recipients,
 		RawMessage:  input.RawMessage,
 		MessageSize: int64(len(input.RawMessage)),

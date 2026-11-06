@@ -2,6 +2,7 @@ package outbox
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -193,4 +194,110 @@ func (r *Repository) MarkFailed(
 	}
 
 	return nil
+}
+
+// ListDead returns terminally failed events for operational inspection.
+func (r *Repository) ListDead(ctx context.Context, limit int) ([]DeadEvent, error) {
+	if limit < 1 || limit > 1000 {
+		limit = 100
+	}
+
+	rows, err := r.db.Query(ctx, `
+		SELECT id::text, event_type, aggregate_id::text, attempts,
+		       COALESCE(last_error, ''), created_at
+		FROM outbox_events
+		WHERE status = 'dead'
+		ORDER BY created_at ASC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list dead outbox events: %w", err)
+	}
+	defer rows.Close()
+
+	dead := make([]DeadEvent, 0)
+	for rows.Next() {
+		var event DeadEvent
+		if err := rows.Scan(
+			&event.ID,
+			&event.EventType,
+			&event.AggregateID,
+			&event.Attempts,
+			&event.LastError,
+			&event.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan dead outbox event: %w", err)
+		}
+		dead = append(dead, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dead outbox events: %w", err)
+	}
+	return dead, nil
+}
+
+// RequeueDead atomically records an audit row and makes one dead event eligible
+// for publication again. It deliberately requires an event ID so operators do
+// not accidentally replay the entire dead-letter population.
+func (r *Repository) RequeueDead(ctx context.Context, eventID, replayedBy string) error {
+	if eventID == "" {
+		return fmt.Errorf("event ID is required")
+	}
+	if replayedBy == "" {
+		return fmt.Errorf("replayed-by identity is required")
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin outbox replay transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	var attempts int
+	var lastError sql.NullString
+	if err := tx.QueryRow(ctx, `
+		SELECT attempts, last_error
+		FROM outbox_events
+		WHERE id = $1 AND status = 'dead'
+		FOR UPDATE
+	`, eventID).Scan(&attempts, &lastError); err != nil {
+		return fmt.Errorf("load dead outbox event %s: %w", eventID, err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO outbox_event_replays
+			(event_id, replayed_by, previous_attempts, previous_last_error)
+		VALUES ($1, $2, $3, $4)
+	`, eventID, replayedBy, attempts, nullableString(lastError)); err != nil {
+		return fmt.Errorf("audit outbox event replay: %w", err)
+	}
+
+	result, err := tx.Exec(ctx, `
+		UPDATE outbox_events
+		SET status = 'pending',
+		    attempts = 0,
+		    available_at = NOW(),
+		    locked_until = NULL,
+		    lease_token = NULL,
+		    published_at = NULL
+		WHERE id = $1 AND status = 'dead'
+	`, eventID)
+	if err != nil {
+		return fmt.Errorf("requeue dead outbox event: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return fmt.Errorf("outbox event %s is no longer dead", eventID)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit outbox event replay: %w", err)
+	}
+	return nil
+}
+
+func nullableString(value sql.NullString) any {
+	if !value.Valid {
+		return nil
+	}
+	return value.String
 }

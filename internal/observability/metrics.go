@@ -33,6 +33,12 @@ type Metrics struct {
 	RedisPendingMessages   prometheus.Gauge
 	RedisConsumers         prometheus.Gauge
 	RedisOldestPendingIdle prometheus.Gauge
+	RedisMessagesReclaimed prometheus.Counter
+
+	RedisStreamTrimmedEntries       prometheus.Counter
+	RedisStreamRetentionRuns        prometheus.Counter
+	RedisStreamRetentionErrors      prometheus.Counter
+	RedisStreamRetentionLastSuccess prometheus.Gauge
 }
 
 func NewMetrics() *Metrics {
@@ -162,6 +168,41 @@ func NewMetrics() *Metrics {
 				Help: "Idle time of the oldest pending Redis delivery message in seconds.",
 			},
 		),
+
+		RedisMessagesReclaimed: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "mailforge_redis_messages_reclaimed_total",
+				Help: "Total Redis stream messages reclaimed from stale consumers.",
+			},
+		),
+
+		RedisStreamTrimmedEntries: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "mailforge_redis_stream_trimmed_entries_total",
+				Help: "Total Redis delivery stream entries trimmed.",
+			},
+		),
+
+		RedisStreamRetentionRuns: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "mailforge_redis_stream_retention_runs_total",
+				Help: "Number of Redis stream retention runs acquired by this worker.",
+			},
+		),
+
+		RedisStreamRetentionErrors: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "mailforge_redis_stream_retention_errors_total",
+				Help: "Number of Redis stream retention failures.",
+			},
+		),
+
+		RedisStreamRetentionLastSuccess: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "mailforge_redis_stream_retention_last_success_timestamp_seconds",
+				Help: "Unix timestamp of the last successful Redis stream retention run.",
+			},
+		),
 	}
 
 	m.SMTPAuthenticationsTotal.WithLabelValues("success")
@@ -184,6 +225,11 @@ func NewMetrics() *Metrics {
 		m.RedisPendingMessages,
 		m.RedisConsumers,
 		m.RedisOldestPendingIdle,
+		m.RedisMessagesReclaimed,
+		m.RedisStreamTrimmedEntries,
+		m.RedisStreamRetentionRuns,
+		m.RedisStreamRetentionErrors,
+		m.RedisStreamRetentionLastSuccess,
 	)
 
 	return m

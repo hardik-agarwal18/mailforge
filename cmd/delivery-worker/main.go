@@ -115,7 +115,15 @@ func main() {
 		consumerName,
 	)
 
-	smtpClient := outbound.NewClient()
+	operationTimeout := envDuration("SMTP_OPERATION_TIMEOUT", 30*time.Second)
+	deliveryTimeout := envDuration("SMTP_DELIVERY_TIMEOUT", 2*time.Minute)
+	smtpClient, err := outbound.NewClientWithConfig(outbound.Config{
+		OperationTimeout: operationTimeout,
+		DeliveryTimeout:  deliveryTimeout,
+	})
+	if err != nil {
+		log.Fatalf("SMTP client configuration failed: %v", err)
+	}
 
 	relayHost := os.Getenv("SMTP_RELAY_HOST")
 
@@ -131,8 +139,10 @@ func main() {
 		}
 
 		smtpClient, err = outbound.NewRelayClient(outbound.Config{
-			RelayHost: relayHost,
-			RelayPort: relayPort,
+			RelayHost:        relayHost,
+			RelayPort:        relayPort,
+			OperationTimeout: operationTimeout,
+			DeliveryTimeout:  deliveryTimeout,
 			RequireSTARTTLS: strings.EqualFold(
 				os.Getenv("SMTP_REQUIRE_STARTTLS"),
 				"true",
@@ -165,4 +175,16 @@ func main() {
 	if err := worker.Run(ctx); err != nil {
 		log.Fatalf("Worker failed: %v", err)
 	}
+}
+
+func envDuration(name string, fallback time.Duration) time.Duration {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		log.Fatalf("%s must be a positive duration (for example 30s or 2m)", name)
+	}
+	return parsed
 }

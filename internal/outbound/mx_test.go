@@ -1,0 +1,36 @@
+package outbound
+
+import (
+	"net"
+	"testing"
+)
+
+func TestIsPublicIP(t *testing.T) {
+	tests := []struct {
+		name string
+		ip   string
+		want bool
+	}{
+		{name: "public IPv4", ip: "8.8.8.8", want: true},
+		{name: "public IPv6", ip: "2606:4700:4700::1111", want: true},
+		{name: "RFC1918", ip: "10.0.0.1", want: false},
+		{name: "loopback", ip: "127.0.0.1", want: false},
+		{name: "link local metadata", ip: "169.254.169.254", want: false},
+		{name: "shared carrier grade NAT", ip: "100.64.0.1", want: false},
+		{name: "documentation IPv4", ip: "192.0.2.10", want: false},
+		{name: "reserved IPv4", ip: "240.0.0.1", want: false},
+		{name: "IPv6 unique local", ip: "fd00::1", want: false},
+		{name: "IPv6 discard only", ip: "100::1", want: false},
+		{name: "IPv6 documentation", ip: "3fff::1", want: false},
+		{name: "IPv6 link local", ip: "fe80::1", want: false},
+		{name: "IPv6 documentation", ip: "2001:db8::1", want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isPublicIP(net.ParseIP(test.ip)); got != test.want {
+				t.Fatalf("isPublicIP(%s) = %v, want %v", test.ip, got, test.want)
+			}
+		})
+	}
+}

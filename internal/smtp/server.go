@@ -12,6 +12,7 @@ import (
 	"mailforge/internal/message"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,9 +35,14 @@ type Server struct {
 	messageAcceptor MessageAcceptor
 	metrics         MetricsRecorder
 
-	submission    bool
-	tlsConfig     *tls.Config
-	authenticator Authenticator
+	submission      bool
+	tlsConfig       *tls.Config
+	authenticator   Authenticator
+	limits          ServerLimits
+	connectionSlots chan struct{}
+	authSlots       chan struct{}
+	dataSlots       chan struct{}
+	rateLimiter     *fixedWindowLimiter
 }
 
 func NewServer(
@@ -44,11 +50,7 @@ func NewServer(
 	messageAcceptor MessageAcceptor,
 	metrics MetricsRecorder,
 ) *Server {
-	return &Server{
-		Address:         address,
-		messageAcceptor: messageAcceptor,
-		metrics:         metrics,
-	}
+	return newServer(address, messageAcceptor, metrics, false, nil, nil, DefaultServerLimits())
 }
 
 // NewSubmissionServer creates an SMTP submission listener. STARTTLS and AUTH are
@@ -60,6 +62,19 @@ func NewSubmissionServer(
 	metrics MetricsRecorder,
 	tlsConfig *tls.Config,
 	authenticator Authenticator,
+) (*Server, error) {
+	return NewSubmissionServerWithLimits(address, messageAcceptor, metrics, tlsConfig, authenticator, DefaultServerLimits())
+}
+
+// NewSubmissionServerWithLimits creates an authenticated submission server
+// with explicit resource and abuse-prevention limits.
+func NewSubmissionServerWithLimits(
+	address string,
+	messageAcceptor MessageAcceptor,
+	metrics MetricsRecorder,
+	tlsConfig *tls.Config,
+	authenticator Authenticator,
+	limits ServerLimits,
 ) (*Server, error) {
 	if messageAcceptor == nil {
 		return nil, fmt.Errorf("message acceptor is required")
@@ -76,14 +91,32 @@ func NewSubmissionServer(
 		config.MinVersion = tls.VersionTLS12
 	}
 
+	return newServer(address, messageAcceptor, metrics, true, config, authenticator, limits), nil
+}
+
+func newServer(
+	address string,
+	messageAcceptor MessageAcceptor,
+	metrics MetricsRecorder,
+	submission bool,
+	tlsConfig *tls.Config,
+	authenticator Authenticator,
+	limits ServerLimits,
+) *Server {
+	limits = normalizeServerLimits(limits)
 	return &Server{
 		Address:         address,
 		messageAcceptor: messageAcceptor,
 		metrics:         metrics,
-		submission:      true,
-		tlsConfig:       config,
+		submission:      submission,
+		tlsConfig:       tlsConfig,
 		authenticator:   authenticator,
-	}, nil
+		limits:          limits,
+		connectionSlots: make(chan struct{}, limits.MaxConnections),
+		authSlots:       make(chan struct{}, limits.MaxConcurrentAuth),
+		dataSlots:       make(chan struct{}, limits.MaxConcurrentData),
+		rateLimiter:     newFixedWindowLimiter(50_000),
+	}
 }
 
 func (s *Server) Start() error {
@@ -95,14 +128,16 @@ func (s *Server) StartContext(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	defer listener.Close()
-	stopClose := context.AfterFunc(ctx, func() {
+
+	stopClose := context.AfterFunc(ctx, func() { _ = listener.Close() })
+	var connections sync.WaitGroup
+	defer func() {
+		stopClose()
 		_ = listener.Close()
-	})
-	defer stopClose()
+		connections.Wait()
+	}()
 
 	log.Println("MailForge SMTP listening on", s.Address)
-
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -112,11 +147,31 @@ func (s *Server) StartContext(ctx context.Context) error {
 			return fmt.Errorf("accept SMTP connection: %w", err)
 		}
 
-		go s.handleConnection(conn)
+		select {
+		case s.connectionSlots <- struct{}{}:
+			connections.Add(1)
+			go func(conn net.Conn) {
+				defer connections.Done()
+				defer func() { <-s.connectionSlots }()
+				s.handleConnectionContext(ctx, conn)
+			}(conn)
+		default:
+			_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+			_ = writeReply(conn, "421 4.3.2 Too many concurrent connections")
+			_ = conn.Close()
+		}
 	}
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
+	s.handleConnectionContext(context.Background(), conn)
+}
+
+func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
+	baseConn := conn
+	stopClose := context.AfterFunc(ctx, func() { _ = baseConn.Close() })
+	defer stopClose()
+
 	if s.metrics != nil {
 		s.metrics.RecordConnectionOpened()
 		defer s.metrics.RecordConnectionClosed()
@@ -175,6 +230,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			session.ResetTransaction()
 			session.Hostname = cmd.Arg
 			session.ESMTP = false
+			session.State = StateReady
 			_ = writeReply(conn, "250 mailforge.local")
 
 		case "STARTTLS":
@@ -200,7 +256,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 
 			tlsConn := tls.Server(conn, s.tlsConfig)
-			handshakeCtx, cancel := context.WithTimeout(context.Background(), tlsHandshakeTimeout)
+			handshakeCtx, cancel := context.WithTimeout(ctx, tlsHandshakeTimeout)
 			err := tlsConn.HandshakeContext(handshakeCtx)
 			cancel()
 			if err != nil {
@@ -241,7 +297,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 				return
 			}
 
+			_ = conn.SetDeadline(time.Now().Add(authenticationTimeout))
 			username, password, authErr := readAuthCredentials(conn, reader, cmd.Arg)
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Minute))
 			if authErr != nil {
 				if errors.Is(authErr, errUnsupportedAuthMechanism) {
 					_ = writeReply(conn, "504 5.5.4 Unrecognized authentication mechanism")
@@ -255,9 +313,23 @@ func (s *Server) handleConnection(conn net.Conn) {
 				continue
 			}
 
-			authCtx, cancel := context.WithTimeout(context.Background(), authenticationTimeout)
+			clientIP := remoteIP(conn)
+			if !s.rateLimiter.Allow(limiterKey("auth-ip", clientIP), s.limits.AuthAttemptsPerIP, s.limits.AuthWindow) ||
+				!s.rateLimiter.Allow(limiterKey("auth-user", strings.ToLower(username)), s.limits.AuthAttemptsPerUsername, s.limits.AuthWindow) {
+				_ = writeReply(conn, "454 4.7.0 Too many authentication attempts; try again later")
+				return
+			}
+
+			select {
+			case s.authSlots <- struct{}{}:
+			default:
+				_ = writeReply(conn, "454 4.7.0 Authentication capacity temporarily exhausted")
+				return
+			}
+			authCtx, cancel := context.WithTimeout(ctx, authenticationTimeout)
 			identity, authErr := s.authenticator.Authenticate(authCtx, username, password)
 			cancel()
+			<-s.authSlots
 			if authErr != nil {
 				if errors.Is(authErr, ErrInvalidCredentials) {
 					if s.metrics != nil {
@@ -334,6 +406,10 @@ func (s *Server) handleConnection(conn net.Conn) {
 				continue
 			}
 
+			if len(session.Recipients) >= s.limits.MaxRecipients {
+				_ = writeReply(conn, "452 4.5.3 Too many recipients")
+				continue
+			}
 			session.Recipients = append(session.Recipients, address)
 			session.State = StateRecipient
 			_ = writeReply(conn, "250 2.1.5 Recipient accepted")
@@ -347,14 +423,22 @@ func (s *Server) handleConnection(conn net.Conn) {
 				_ = writeReply(conn, "501 5.5.4 DATA takes no arguments")
 				continue
 			}
+			select {
+			case s.dataSlots <- struct{}{}:
+			default:
+				_ = writeReply(conn, "452 4.3.1 Too many concurrent message submissions")
+				continue
+			}
 
 			if err := writeReply(conn, "354 End data with <CRLF>.<CRLF>"); err != nil {
+				<-s.dataSlots
 				return
 			}
 
 			submissionStarted := time.Now()
 			rawMessage, err := receiveMessage(reader)
 			if err != nil {
+				<-s.dataSlots
 				if s.metrics != nil {
 					s.metrics.RecordSubmission(time.Since(submissionStarted), false)
 				}
@@ -364,16 +448,22 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 
 			session.MessageData = rawMessage
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			clientIP := ""
+			if s.submission {
+				clientIP = remoteIP(conn)
+			}
+			acceptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			stored, err := s.messageAcceptor.Accept(
-				ctx,
+				acceptCtx,
 				message.NewMessage{
 					Sender:     session.Sender,
+					ClientIP:   clientIP,
 					Recipients: session.Recipients,
 					RawMessage: session.MessageData,
 				},
 			)
 			cancel()
+			<-s.dataSlots
 
 			if s.metrics != nil {
 				s.metrics.RecordSubmission(time.Since(submissionStarted), err == nil)
@@ -381,7 +471,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 			if err != nil {
 				log.Printf("Message persistence failed: %v", err)
 				session.ResetTransaction()
-				_ = writeReply(conn, "451 4.3.0 Temporary message storage failure")
+				if errors.Is(err, message.ErrSubmissionQuotaExceeded) {
+					_ = writeReply(conn, "452 4.7.0 Submission rate limit exceeded; try again later")
+				} else {
+					_ = writeReply(conn, "451 4.3.0 Temporary message storage failure")
+				}
 				continue
 			}
 
@@ -421,6 +515,17 @@ func (s *Server) ehloCapabilities(session *Session) []string {
 	}
 	lines = append(lines, "250 HELP")
 	return lines
+}
+
+func remoteIP(conn net.Conn) string {
+	if conn == nil || conn.RemoteAddr() == nil {
+		return "unknown"
+	}
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err == nil {
+		return host
+	}
+	return conn.RemoteAddr().String()
 }
 
 func readAuthCredentials(conn net.Conn, reader *bufio.Reader, argument string) (string, string, error) {

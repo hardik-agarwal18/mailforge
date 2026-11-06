@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -51,7 +52,21 @@ func main() {
 	}
 	defer pool.Close()
 
-	messageRepository := message.NewRepository(pool)
+	limits := smtp.DefaultServerLimits()
+	limits.MaxConnections = envInt("SMTP_MAX_CONNECTIONS", limits.MaxConnections)
+	limits.MaxRecipients = envInt("SMTP_MAX_RECIPIENTS", limits.MaxRecipients)
+	limits.MaxConcurrentAuth = envInt("SMTP_MAX_CONCURRENT_AUTH", limits.MaxConcurrentAuth)
+	limits.MaxConcurrentData = envInt("SMTP_MAX_CONCURRENT_DATA", limits.MaxConcurrentData)
+	limits.AuthAttemptsPerIP = envInt("SMTP_AUTH_ATTEMPTS_PER_IP", limits.AuthAttemptsPerIP)
+	limits.AuthAttemptsPerUsername = envInt("SMTP_AUTH_ATTEMPTS_PER_USERNAME", limits.AuthAttemptsPerUsername)
+
+	quotas := message.DefaultSubmissionQuotaLimits()
+	quotas.MaxMessagesPerAccountPerHour = envInt("SMTP_MAX_SUBMISSIONS_PER_ACCOUNT_PER_HOUR", quotas.MaxMessagesPerAccountPerHour)
+	quotas.MaxMessagesPerIPPerHour = envInt("SMTP_MAX_SUBMISSIONS_PER_IP_PER_HOUR", quotas.MaxMessagesPerIPPerHour)
+	quotas.MaxRecipientsPerAccountPerHour = envInt("SMTP_MAX_RECIPIENTS_PER_ACCOUNT_PER_HOUR", quotas.MaxRecipientsPerAccountPerHour)
+	quotas.MaxRecipientsPerIPPerHour = envInt("SMTP_MAX_RECIPIENTS_PER_IP_PER_HOUR", quotas.MaxRecipientsPerIPPerHour)
+
+	messageRepository := message.NewRepositoryWithQuota(pool, quotas)
 	messageService := message.NewService(messageRepository)
 	credentialRepository := smtpauth.NewRepository(pool)
 	metrics := observability.NewMetrics()
@@ -66,12 +81,13 @@ func main() {
 		submissionAddr = ":587"
 	}
 
-	submissionServer, err := smtp.NewSubmissionServer(
+	submissionServer, err := smtp.NewSubmissionServerWithLimits(
 		submissionAddr,
 		messageService,
 		metrics,
 		tlsConfig,
 		credentialRepository,
+		limits,
 	)
 	if err != nil {
 		log.Fatalf("configure SMTP submission server: %v", err)
@@ -105,4 +121,16 @@ func main() {
 	if err := submissionServer.StartContext(ctx); err != nil {
 		log.Fatalf("SMTP submission server failed: %v", err)
 	}
+}
+
+func envInt(name string, fallback int) int {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		log.Fatalf("%s must be a positive integer", name)
+	}
+	return parsed
 }

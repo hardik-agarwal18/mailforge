@@ -283,3 +283,68 @@ func TestReadAuthCredentialsLogin(t *testing.T) {
 		t.Fatalf("credentials = (%q, %q)", got.username, got.password)
 	}
 }
+
+func TestHELOAllowsMailTransaction(t *testing.T) {
+	acceptor := &testAcceptor{}
+	server := NewServer("127.0.0.1:0", acceptor, nil)
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		server.handleConnection(serverConn)
+		close(done)
+	}()
+	defer clientConn.Close()
+
+	reader := bufio.NewReader(clientConn)
+	assertCode(t, readReply(t, reader), "220")
+	writeCommand(t, clientConn, "HELO legacy-client.example")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "MAIL FROM:<sender@example.com>")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "RCPT TO:<recipient@example.net>")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "DATA")
+	assertCode(t, readReply(t, reader), "354")
+	if _, err := clientConn.Write([]byte("Subject: HELO test\r\n\r\nhello\r\n.\r\n")); err != nil {
+		t.Fatalf("write DATA: %v", err)
+	}
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "QUIT")
+	assertCode(t, readReply(t, reader), "221")
+	_ = clientConn.Close()
+	<-done
+
+	if acceptor.calls != 1 {
+		t.Fatalf("message acceptor calls = %d, want 1", acceptor.calls)
+	}
+}
+
+func TestRecipientLimitIsEnforced(t *testing.T) {
+	acceptor := &testAcceptor{}
+	server := &Server{
+		messageAcceptor: acceptor,
+		limits:          normalizeServerLimits(ServerLimits{MaxRecipients: 1}),
+	}
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		server.handleConnection(serverConn)
+		close(done)
+	}()
+	defer clientConn.Close()
+
+	reader := bufio.NewReader(clientConn)
+	assertCode(t, readReply(t, reader), "220")
+	writeCommand(t, clientConn, "HELO legacy-client.example")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "MAIL FROM:<sender@example.com>")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "RCPT TO:<first@example.net>")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "RCPT TO:<second@example.net>")
+	assertCode(t, readReply(t, reader), "452")
+	writeCommand(t, clientConn, "QUIT")
+	assertCode(t, readReply(t, reader), "221")
+	_ = clientConn.Close()
+	<-done
+}
