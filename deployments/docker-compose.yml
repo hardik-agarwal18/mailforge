@@ -80,7 +80,7 @@ services:
     container_name: mailforge-grafana
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:13001:3000"
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: mailforge_admin
