@@ -36,3 +36,49 @@ groups:
         annotations:
           summary: "MailForge delivery worker is down"
           description: "A delivery worker metrics endpoint is unavailable."
+
+  - name: mailforge-postgres-alerts
+    rules:
+      - alert: MailForgePostgresExporterDown
+        expr: up{job="mailforge-postgres"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL exporter is unavailable"
+          description: "Prometheus cannot scrape PostgreSQL exporter."
+
+      - alert: MailForgePostgresDown
+        expr: pg_up{job="mailforge-postgres"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mailforge PostgreSQL is unavailable"
+          description: "PostgreSQL exporter cannot connect to the database."
+
+      - alert: MailForgePostgresConnectionsHigh
+        expr: |
+          (
+            sum(pg_stat_database_numbackends{datname="mailforge"})
+            /
+            max(pg_settings_max_connections)
+          ) > 0.85
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL connection utilization is high"
+          description: "Connection utilization exceeded 85% for two minutes."
+
+      - alert: MailForgePostgresDeadlocks
+        expr: |
+          sum(rate(
+            pg_stat_database_deadlocks{datname="mailforge"}[5m]
+          )) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL deadlocks detected"
+          description: "PostgreSQL is reporting deadlocks."

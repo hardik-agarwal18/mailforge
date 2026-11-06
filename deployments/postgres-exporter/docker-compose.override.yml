@@ -1,0 +1,17 @@
+services:
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.20.1
+    container_name: mailforge-postgres-exporter
+    restart: unless-stopped
+
+    environment:
+      DATA_SOURCE_URI: "postgres:5432/${POSTGRES_DB}?sslmode=disable"
+      DATA_SOURCE_USER: ${POSTGRES_EXPORTER_USER}
+      DATA_SOURCE_PASS: ${POSTGRES_EXPORTER_PASSWORD}
+
+    command:
+      - --web.listen-address=:9187
+
+    depends_on:
+      postgres:
+        condition: service_healthy

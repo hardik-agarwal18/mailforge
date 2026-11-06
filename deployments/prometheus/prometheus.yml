@@ -31,3 +31,8 @@ scrape_configs:
     static_configs:
       - targets:
           - "host.docker.internal:9095"
+
+  - job_name: "mailforge-postgres"
+    static_configs:
+      - targets:
+          - "postgres-exporter:9187"
