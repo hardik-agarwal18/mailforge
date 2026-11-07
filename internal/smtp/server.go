@@ -480,6 +480,10 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 					_ = writeReply(conn, "554 5.6.0 Invalid sender envelope")
 				case errors.Is(err, message.ErrInvalidRecipient):
 					_ = writeReply(conn, "554 5.6.0 Invalid recipient envelope")
+				case errors.Is(err, message.ErrInvalidMessageFormat):
+					_ = writeReply(conn, "554 5.6.0 Message content is not valid RFC 5322/MIME")
+				case errors.Is(err, message.ErrMIMEMessageTooLarge):
+					_ = writeReply(conn, "552 5.3.4 Decoded MIME content exceeds the configured limit")
 				default:
 					_ = writeReply(conn, "451 4.3.0 Temporary message storage failure")
 				}

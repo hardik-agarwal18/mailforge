@@ -11,6 +11,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"mailforge/internal/mimeparser"
 )
 
 var ErrSubmissionQuotaExceeded = errors.New("SMTP submission quota exceeded")
@@ -78,8 +80,16 @@ func (r *Repository) Create(
 		}
 	}
 
-	// 1. Insert message.
+	// 1. Insert the original message plus its parsed, indexed MIME representation.
 	var messageID string
+	parsedMetadata := `{}`
+	if msg.Parsed != nil {
+		metadataBytes, marshalErr := json.Marshal(msg.Parsed)
+		if marshalErr != nil {
+			return "", fmt.Errorf("marshal parsed MIME metadata: %w", marshalErr)
+		}
+		parsedMetadata = string(metadataBytes)
+	}
 
 	err = tx.QueryRow(
 		ctx,
@@ -88,15 +98,23 @@ func (r *Repository) Create(
 			message_id,
 			envelope_sender,
 			raw_message,
-			message_size
+			message_size,
+			subject,
+			text_body,
+			html_body,
+			mime_metadata
 		)
-		VALUES ($1, $2, $3, $4)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id::text
 		`,
 		msg.MessageID,
 		msg.Sender,
 		msg.RawMessage,
 		msg.MessageSize,
+		parsedSubject(msg.Parsed),
+		parsedTextBody(msg.Parsed),
+		parsedHTMLBody(msg.Parsed),
+		parsedMetadata,
 	).Scan(&messageID)
 
 	if err != nil {
@@ -184,6 +202,27 @@ func (r *Repository) Create(
 	}
 
 	return messageID, nil
+}
+
+func parsedSubject(parsed *mimeparser.ParsedMessage) string {
+	if parsed == nil {
+		return ""
+	}
+	return parsed.Subject
+}
+
+func parsedTextBody(parsed *mimeparser.ParsedMessage) string {
+	if parsed == nil {
+		return ""
+	}
+	return parsed.TextBody
+}
+
+func parsedHTMLBody(parsed *mimeparser.ParsedMessage) string {
+	if parsed == nil {
+		return ""
+	}
+	return parsed.HTMLBody
 }
 
 func (r *Repository) reserveSubmissionQuota(

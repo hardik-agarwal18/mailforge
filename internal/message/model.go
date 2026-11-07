@@ -1,6 +1,10 @@
 package message
 
-import "time"
+import (
+	"time"
+
+	"mailforge/internal/mimeparser"
+)
 
 type NewMessage struct {
 	Sender     string
@@ -16,6 +20,7 @@ type StoredMessage struct {
 	ClientIP    string
 	Recipients  []string
 	RawMessage  []byte
+	Parsed      *mimeparser.ParsedMessage
 	MessageSize int64
 	CreatedAt   time.Time
 }

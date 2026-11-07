@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"mailforge/internal/emailaddr"
+	"mailforge/internal/mimeparser"
 )
 
 const (
@@ -17,8 +18,10 @@ const (
 )
 
 var (
-	ErrInvalidSender    = errors.New("invalid envelope sender")
-	ErrInvalidRecipient = errors.New("invalid envelope recipient")
+	ErrInvalidSender        = errors.New("invalid envelope sender")
+	ErrInvalidRecipient     = errors.New("invalid envelope recipient")
+	ErrInvalidMessageFormat = errors.New("invalid RFC 5322 or MIME message")
+	ErrMIMEMessageTooLarge  = errors.New("MIME message exceeds parser limits")
 )
 
 type MessageCreator interface {
@@ -68,12 +71,21 @@ func (s *Service) Accept(
 		}
 	}
 
+	parsed, err := mimeparser.Parse(input.RawMessage)
+	if err != nil {
+		if errors.Is(err, mimeparser.ErrMIMETooLarge) {
+			return StoredMessage{}, fmt.Errorf("%w: %v", ErrMIMEMessageTooLarge, err)
+		}
+		return StoredMessage{}, fmt.Errorf("%w: %v", ErrInvalidMessageFormat, err)
+	}
+
 	stored := StoredMessage{
 		MessageID:   fmt.Sprintf("<%s@%s>", uuid.NewString(), messageDomain),
 		Sender:      input.Sender,
 		ClientIP:    input.ClientIP,
 		Recipients:  input.Recipients,
 		RawMessage:  input.RawMessage,
+		Parsed:      parsed,
 		MessageSize: int64(len(input.RawMessage)),
 		CreatedAt:   time.Now().UTC(),
 	}

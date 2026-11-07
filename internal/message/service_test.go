@@ -3,6 +3,7 @@ package message
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -98,5 +99,73 @@ func TestAcceptPersistsValidEnvelope(t *testing.T) {
 	}
 	if creator.calls != 1 {
 		t.Fatalf("repository Create calls = %d, want 1", creator.calls)
+	}
+}
+
+func TestAcceptParsesMIMEBeforePersistence(t *testing.T) {
+	creator := &recordingCreator{}
+	service := NewService(creator)
+	raw := []byte("From: Alice <alice@example.com>\r\n" +
+		"To: Bob <bob@example.net>\r\n" +
+		"Subject: Parsed message\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\nHello MailForge\r\n")
+
+	stored, err := service.Accept(context.Background(), NewMessage{
+		Sender: "alice@example.com", Recipients: []string{"bob@example.net"}, RawMessage: raw,
+	})
+	if err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	if creator.calls != 1 {
+		t.Fatalf("repository Create calls = %d, want 1", creator.calls)
+	}
+	if creator.msg.Parsed == nil {
+		t.Fatal("repository did not receive parsed MIME metadata")
+	}
+	if creator.msg.Parsed.Subject != "Parsed message" {
+		t.Fatalf("parsed subject = %q", creator.msg.Parsed.Subject)
+	}
+	if creator.msg.Parsed.TextBody != "Hello MailForge\r\n" {
+		t.Fatalf("parsed text body = %q", creator.msg.Parsed.TextBody)
+	}
+	if string(creator.msg.RawMessage) != string(raw) {
+		t.Fatal("raw message was modified during MIME parsing")
+	}
+	if stored.Parsed == nil {
+		t.Fatal("returned StoredMessage has no parsed MIME metadata")
+	}
+}
+
+func TestAcceptRejectsMalformedMIMEBeforePersistence(t *testing.T) {
+	creator := &recordingCreator{}
+	service := NewService(creator)
+	_, err := service.Accept(context.Background(), NewMessage{
+		Sender:     "sender@example.com",
+		Recipients: []string{"recipient@example.net"},
+		RawMessage: []byte("Content-Type: invalid-type\r\n\r\nbody\r\n"),
+	})
+	if !errors.Is(err, ErrInvalidMessageFormat) {
+		t.Fatalf("Accept() error = %v, want ErrInvalidMessageFormat", err)
+	}
+	if creator.calls != 0 {
+		t.Fatalf("repository Create called %d times for invalid MIME", creator.calls)
+	}
+}
+
+func TestAcceptRejectsMIMELimitViolation(t *testing.T) {
+	creator := &recordingCreator{}
+	service := NewService(creator)
+	service.maxMessageSize = 12 << 20
+	_, err := service.Accept(context.Background(), NewMessage{
+		Sender:     "sender@example.com",
+		Recipients: []string{"recipient@example.net"},
+		RawMessage: []byte("Content-Type: text/plain; charset=utf-8\r\n\r\n" + strings.Repeat("x", 10*1024*1024+1)),
+	})
+	if !errors.Is(err, ErrMIMEMessageTooLarge) {
+		t.Fatalf("Accept() error = %v, want ErrMIMEMessageTooLarge", err)
+	}
+	if creator.calls != 0 {
+		t.Fatalf("repository Create called %d times for oversized MIME", creator.calls)
 	}
 }
