@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/netip"
 	"sort"
@@ -11,7 +12,11 @@ import (
 	"mailforge/internal/emailaddr"
 )
 
-var ErrNoPublicMXAddress = errors.New("MX host has no publicly routable IP address")
+var (
+	ErrNoPublicMXAddress = errors.New("MX host has no publicly routable IP address")
+	ErrNullMX            = errors.New("recipient domain publishes a Null MX and does not accept email")
+	ErrInvalidMXSet      = errors.New("recipient domain publishes an invalid MX set")
+)
 
 // MXResolver performs MX and address lookups. Direct-to-MX delivery must use
 // LookupPublicIPs and dial the returned IPs directly; dialing the hostname
@@ -45,11 +50,39 @@ func (r *MXResolver) Lookup(ctx context.Context, email string) ([]*net.MX, error
 	if len(records) == 0 {
 		return []*net.MX{{Host: domain, Pref: 0}}, nil
 	}
+	if err := detectNullMX(domain, records); err != nil {
+		return nil, err
+	}
 
-	sort.Slice(records, func(i, j int) bool {
+	sort.SliceStable(records, func(i, j int) bool {
 		return records[i].Pref < records[j].Pref
 	})
+
+	// RFC 5321 requires randomizing hosts that have equal preference so
+	// senders do not concentrate all traffic on one nominally equivalent MX.
+	for start := 0; start < len(records); {
+		end := start + 1
+		for end < len(records) && records[end].Pref == records[start].Pref {
+			end++
+		}
+		rand.Shuffle(end-start, func(i, j int) {
+			records[start+i], records[start+j] = records[start+j], records[start+i]
+		})
+		start = end
+	}
 	return records, nil
+}
+
+func detectNullMX(domain string, records []*net.MX) error {
+	if len(records) == 1 && records[0].Host == "." && records[0].Pref == 0 {
+		return fmt.Errorf("%w: %s", ErrNullMX, domain)
+	}
+	for _, record := range records {
+		if record.Host == "." {
+			return fmt.Errorf("%w: %s: Null MX must be the only MX record", ErrInvalidMXSet, domain)
+		}
+	}
+	return nil
 }
 
 // LookupPublicIPs returns only globally routable addresses. The caller must

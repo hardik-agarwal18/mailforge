@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 )
@@ -41,5 +42,18 @@ func TestMXResolverRejectsMalformedRecipientBeforeDNS(t *testing.T) {
 	_, err := resolver.Lookup(context.Background(), "recipient@@example.com")
 	if err == nil {
 		t.Fatal("Lookup() accepted malformed recipient address")
+	}
+}
+
+func TestNullMXDetection(t *testing.T) {
+	err := detectNullMX("example.invalid", []*net.MX{{Host: ".", Pref: 0}})
+	if !errors.Is(err, ErrNullMX) {
+		t.Fatalf("detectNullMX error = %v, want ErrNullMX", err)
+	}
+	if err := detectNullMX("example.invalid", []*net.MX{{Host: "mx.example.invalid.", Pref: 10}}); err != nil {
+		t.Fatalf("ordinary MX should be accepted: %v", err)
+	}
+	if err := detectNullMX("example.invalid", []*net.MX{{Host: ".", Pref: 0}, {Host: "mx.example.invalid.", Pref: 10}}); !errors.Is(err, ErrInvalidMXSet) {
+		t.Fatalf("mixed Null MX and ordinary MX set error = %v, want ErrInvalidMXSet", err)
 	}
 }

@@ -3,6 +3,7 @@ package outbound
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/textproto"
 	"testing"
 )
@@ -72,5 +73,17 @@ func TestClassifyNetworkErrorAsTemporary(t *testing.T) {
 func TestClassifyNilError(t *testing.T) {
 	if got := classifyError(nil); got != nil {
 		t.Fatalf("expected nil, got %v", got)
+	}
+}
+
+func TestClassifyDNSNotFoundAsPermanent(t *testing.T) {
+	dnsErr := &net.DNSError{Err: "no such host", Name: "does-not-exist.invalid", IsNotFound: true}
+	got := classifyError(fmt.Errorf("MX lookup: %w", dnsErr))
+	var deliveryErr *DeliveryError
+	if !errors.As(got, &deliveryErr) {
+		t.Fatalf("expected DeliveryError, got %T", got)
+	}
+	if !deliveryErr.Permanent {
+		t.Fatalf("DNS not-found should be permanent: %#v", deliveryErr)
 	}
 }

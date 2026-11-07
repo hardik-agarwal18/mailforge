@@ -16,6 +16,25 @@ import (
 	"mailforge/internal/mimeparser"
 )
 
+// smtpSession owns one already-greeted SMTP connection. It is deliberately
+// kept separate from Send so connection establishment can be tested and
+// reasoned about independently from the SMTP mail transaction.
+type smtpSession struct {
+	client    *smtp.Client
+	conn      net.Conn
+	stopClose func() bool
+}
+
+func (s *smtpSession) close() {
+	if s == nil || s.conn == nil {
+		return
+	}
+	if s.stopClose != nil {
+		s.stopClose()
+	}
+	_ = s.conn.Close()
+}
+
 func (c *Client) Send(
 	ctx context.Context,
 	sender string,
@@ -55,21 +74,31 @@ func (c *Client) Send(
 
 	mxRecords, err := c.resolver.Lookup(deliveryCtx, recipient)
 	if err != nil {
+		if errors.Is(err, ErrNullMX) || errors.Is(err, ErrInvalidMXSet) {
+			return &DeliveryError{Message: err.Error(), Permanent: true}
+		}
 		return classifyError(err)
 	}
 
-	var lastErr error
+	var lastTemporaryErr error
+	var lastPermanentErr error
 	for _, mx := range mxRecords {
 		host := strings.TrimSuffix(mx.Host, ".")
 		ips, resolveErr := c.resolver.LookupPublicIPs(deliveryCtx, host)
 		if resolveErr != nil {
 			if errors.Is(resolveErr, ErrNoPublicMXAddress) {
-				// Skip this MX rather than stopping: the domain may have other
-				// publicly routable MX records at a later preference.
-				lastErr = &DeliveryError{Message: resolveErr.Error(), Permanent: true}
+				lastPermanentErr = &DeliveryError{Message: resolveErr.Error(), Permanent: true}
 			} else {
-				lastErr = classifyError(resolveErr)
+				classified := classifyError(resolveErr)
+				var deliveryErr *DeliveryError
+				if errors.As(classified, &deliveryErr) && deliveryErr.Permanent {
+					lastPermanentErr = classified
+				} else {
+					lastTemporaryErr = classified
+				}
 			}
+			// Skip this MX rather than stopping: the domain may have other
+			// publicly routable MX records at a later preference.
 			continue
 		}
 
@@ -88,27 +117,32 @@ func (c *Client) Send(
 			if err == nil {
 				return nil
 			}
-			lastErr = err
 
 			var deliveryErr *DeliveryError
 			if errors.As(err, &deliveryErr) && deliveryErr.Permanent {
+				// A definitive 5xx SMTP response is a permanent transaction
+				// outcome. Do not route the same recipient through another MX.
 				return deliveryErr
 			}
+			lastTemporaryErr = err
 			if deliveryCtx.Err() != nil {
 				return classifyError(deliveryCtx.Err())
 			}
 		}
 	}
 
-	if lastErr == nil {
-		return fmt.Errorf("no usable MX servers found")
+	// A temporarily unreachable MX must not be hidden by a later MX that was
+	// unusable for a permanent local-policy reason (for example, a private IP
+	// target). Retry the recipient if any candidate may become reachable.
+	if lastTemporaryErr != nil {
+		return lastTemporaryErr
 	}
-	return lastErr
+	if lastPermanentErr != nil {
+		return lastPermanentErr
+	}
+	return &DeliveryError{Message: "no usable MX servers found", Permanent: false}
 }
 
-// sendToHost uses dialAddress for the network connection and tlsServerName for
-// protocol identity. For direct MX delivery dialAddress is a pinned IP; for an
-// explicitly configured relay it is the configured hostname and port.
 func (c *Client) sendToHost(
 	ctx context.Context,
 	tlsServerName string,
@@ -117,37 +151,100 @@ func (c *Client) sendToHost(
 	recipient string,
 	rawMessage []byte,
 ) error {
+	session, err := c.connectToHost(ctx, tlsServerName, dialAddress)
+	if err != nil {
+		return err
+	}
+	defer session.close()
+
+	client := session.client
+	if err := c.setOperationDeadline(ctx, session.conn); err != nil {
+		return classifyError(err)
+	}
+	if err := client.Mail(sender); err != nil {
+		return classifyError(fmt.Errorf("MAIL FROM: %w", err))
+	}
+
+	if err := c.setOperationDeadline(ctx, session.conn); err != nil {
+		return classifyError(err)
+	}
+	if err := client.Rcpt(recipient); err != nil {
+		return classifyError(fmt.Errorf("RCPT TO: %w", err))
+	}
+
+	if err := c.setOperationDeadline(ctx, session.conn); err != nil {
+		return classifyError(err)
+	}
+	writer, err := client.Data()
+	if err != nil {
+		return classifyError(fmt.Errorf("DATA: %w", err))
+	}
+
+	if err := c.setOperationDeadline(ctx, session.conn); err != nil {
+		_ = writer.Close()
+		return classifyError(err)
+	}
+	if _, err := io.Copy(writer, bytes.NewReader(rawMessage)); err != nil {
+		_ = writer.Close()
+		return classifyError(fmt.Errorf("write message: %w", err))
+	}
+
+	if err := c.setOperationDeadline(ctx, session.conn); err != nil {
+		_ = writer.Close()
+		return classifyError(err)
+	}
+	if err := writer.Close(); err != nil {
+		return classifyError(fmt.Errorf("finish DATA: %w", err))
+	}
+	return nil
+}
+
+// connectToHost performs TCP connection establishment, reads the 220 greeting,
+// sends EHLO, and negotiates STARTTLS when offered. It never silently falls
+// back to plaintext after a TLS handshake failure.
+func (c *Client) connectToHost(
+	ctx context.Context,
+	tlsServerName string,
+	dialAddress string,
+) (*smtpSession, error) {
 	conn, err := c.dialer.DialContext(ctx, "tcp", dialAddress)
 	if err != nil {
-		return classifyError(fmt.Errorf("connect to %s: %w", dialAddress, err))
+		return nil, classifyError(fmt.Errorf("connect to %s: %w", dialAddress, err))
 	}
-	defer conn.Close()
 
-	// A cancelled parent context must interrupt a blocked socket operation.
+	// A cancelled parent context must interrupt a blocked greeting, EHLO or
+	// TLS handshake. The callback closes the underlying socket immediately.
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stopClose()
 
 	if err := c.setOperationDeadline(ctx, conn); err != nil {
-		return classifyError(err)
+		stopClose()
+		_ = conn.Close()
+		return nil, classifyError(err)
 	}
 	client, err := smtp.NewClient(conn, tlsServerName)
 	if err != nil {
-		return classifyError(fmt.Errorf("SMTP greeting: %w", err))
+		stopClose()
+		_ = conn.Close()
+		return nil, classifyError(fmt.Errorf("SMTP greeting from %s: %w", tlsServerName, err))
 	}
-	// Close the socket directly on return. Client.Close would issue QUIT and
-	// wait for another SMTP response after delivery has already completed.
 
 	if err := c.setOperationDeadline(ctx, conn); err != nil {
-		return classifyError(err)
+		stopClose()
+		_ = conn.Close()
+		return nil, classifyError(err)
 	}
-	if err := client.Hello("mailforge.local"); err != nil {
-		return classifyError(fmt.Errorf("EHLO: %w", err))
+	if err := client.Hello(c.config.EHLOName); err != nil {
+		stopClose()
+		_ = conn.Close()
+		return nil, classifyError(fmt.Errorf("EHLO %s at %s: %w", c.config.EHLOName, tlsServerName, err))
 	}
 
 	hasSTARTTLS, _ := client.Extension("STARTTLS")
 	if c.config.RequireSTARTTLS && !hasSTARTTLS {
-		return &DeliveryError{
-			Message:   "remote server does not support required STARTTLS",
+		stopClose()
+		_ = conn.Close()
+		return nil, &DeliveryError{
+			Message:   fmt.Sprintf("MX host %s does not support required STARTTLS", tlsServerName),
 			Permanent: false,
 		}
 	}
@@ -158,52 +255,18 @@ func (c *Client) sendToHost(
 			MinVersion: tls.VersionTLS12,
 		}
 		if err := c.setOperationDeadline(ctx, conn); err != nil {
-			return classifyError(err)
+			stopClose()
+			_ = conn.Close()
+			return nil, classifyError(err)
 		}
 		if err := client.StartTLS(tlsConfig); err != nil {
-			return classifyError(fmt.Errorf("STARTTLS: %w", err))
+			stopClose()
+			_ = conn.Close()
+			return nil, classifyError(fmt.Errorf("STARTTLS with %s: %w", tlsServerName, err))
 		}
 	}
 
-	if err := c.setOperationDeadline(ctx, conn); err != nil {
-		return classifyError(err)
-	}
-	if err := client.Mail(sender); err != nil {
-		return classifyError(fmt.Errorf("MAIL FROM: %w", err))
-	}
-
-	if err := c.setOperationDeadline(ctx, conn); err != nil {
-		return classifyError(err)
-	}
-	if err := client.Rcpt(recipient); err != nil {
-		return classifyError(fmt.Errorf("RCPT TO: %w", err))
-	}
-
-	if err := c.setOperationDeadline(ctx, conn); err != nil {
-		return classifyError(err)
-	}
-	writer, err := client.Data()
-	if err != nil {
-		return classifyError(fmt.Errorf("DATA: %w", err))
-	}
-
-	if err := c.setOperationDeadline(ctx, conn); err != nil {
-		_ = writer.Close()
-		return classifyError(err)
-	}
-	if _, err := io.Copy(writer, bytes.NewReader(rawMessage)); err != nil {
-		_ = writer.Close()
-		return classifyError(fmt.Errorf("write message: %w", err))
-	}
-
-	if err := c.setOperationDeadline(ctx, conn); err != nil {
-		_ = writer.Close()
-		return classifyError(err)
-	}
-	if err := writer.Close(); err != nil {
-		return classifyError(fmt.Errorf("finish DATA: %w", err))
-	}
-	return nil
+	return &smtpSession{client: client, conn: conn, stopClose: stopClose}, nil
 }
 
 func (c *Client) setOperationDeadline(ctx context.Context, conn net.Conn) error {

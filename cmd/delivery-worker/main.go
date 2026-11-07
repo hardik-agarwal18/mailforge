@@ -24,6 +24,7 @@ const (
 	defaultRedisAddr        = "127.0.0.1:6379"
 	defaultMetricsAddr      = "127.0.0.1:9091"
 	defaultWorkerCount      = 3
+	defaultConnectTimeout   = 15 * time.Second
 	defaultOperationTimeout = 30 * time.Second
 	defaultDeliveryTimeout  = 2 * time.Minute
 )
@@ -71,6 +72,14 @@ func run() error {
 		return fmt.Errorf(
 			"DELIVERY_WORKER_CONCURRENCY must be at least 1",
 		)
+	}
+
+	connectTimeout, err := envDuration(
+		"SMTP_CONNECT_TIMEOUT",
+		defaultConnectTimeout,
+	)
+	if err != nil {
+		return err
 	}
 
 	operationTimeout, err := envDuration(
@@ -207,8 +216,11 @@ func run() error {
 	// --------------------------------------------------
 
 	smtpConfig := outbound.Config{
+		EHLOName:         envString("SMTP_EHLO_NAME", "localhost"),
+		ConnectTimeout:   connectTimeout,
 		OperationTimeout: operationTimeout,
 		DeliveryTimeout:  deliveryTimeout,
+		RequireSTARTTLS:  strings.EqualFold(os.Getenv("SMTP_REQUIRE_STARTTLS"), "true"),
 	}
 
 	var smtpClient *outbound.Client
@@ -240,10 +252,6 @@ func run() error {
 
 		smtpConfig.RelayHost = relayHost
 		smtpConfig.RelayPort = relayPort
-		smtpConfig.RequireSTARTTLS = strings.EqualFold(
-			os.Getenv("SMTP_REQUIRE_STARTTLS"),
-			"true",
-		)
 
 		smtpClient, err = outbound.NewRelayClient(smtpConfig)
 		if err != nil {
@@ -254,9 +262,11 @@ func run() error {
 		}
 
 		log.Printf(
-			"Using SMTP relay %s:%d",
+			"Using SMTP relay %s:%d (EHLO=%s, require_starttls=%t)",
 			relayHost,
 			relayPort,
+			smtpConfig.EHLOName,
+			smtpConfig.RequireSTARTTLS,
 		)
 	} else {
 		smtpClient, err = outbound.NewClientWithConfig(
@@ -269,7 +279,7 @@ func run() error {
 			)
 		}
 
-		log.Println("Using direct MX delivery")
+		log.Printf("Using direct MX delivery (EHLO=%s, require_starttls=%t)", smtpConfig.EHLOName, smtpConfig.RequireSTARTTLS)
 	}
 
 	// --------------------------------------------------
@@ -294,8 +304,10 @@ func run() error {
 	)
 
 	log.Printf(
-		"Starting MailForge delivery worker: concurrency=%d smtp_timeout=%s",
+		"Starting MailForge delivery worker: concurrency=%d smtp_connect_timeout=%s smtp_operation_timeout=%s smtp_delivery_timeout=%s",
 		workerConcurrency,
+		connectTimeout,
+		operationTimeout,
 		deliveryTimeout,
 	)
 

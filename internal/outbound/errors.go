@@ -3,6 +3,7 @@ package outbound
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/textproto"
 )
 
@@ -31,7 +32,17 @@ func classifyError(err error) error {
 		}
 	}
 
-	// Network, DNS and TLS failures are temporary by default.
+	// A definitive DNS negative response (NXDOMAIN/NODATA) is permanent;
+	// resolver timeouts and temporary DNS failures remain retryable.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return &DeliveryError{
+			Message:   err.Error(),
+			Permanent: true,
+		}
+	}
+
+	// Network, temporary DNS and TLS failures are retryable by default.
 	return &DeliveryError{
 		Message:   err.Error(),
 		Permanent: false,
