@@ -13,10 +13,10 @@ import (
 )
 
 const (
-	DeliveryStream           = "mailforge:delivery"
-	DeliveryDeadLetterStream = "mailforge:delivery:dead"
-	ConsumerGroup            = "mailforge-workers"
-	pendingIdleTimeout       = 2 * time.Minute
+	DeliveryStream            = "mailforge:delivery"
+	DeliveryDeadLetterStream  = "mailforge:delivery:dead"
+	ConsumerGroup             = "mailforge-workers"
+	defaultPendingIdleTimeout = 2 * time.Minute
 )
 
 var quarantineDeliveryEvent = redis.NewScript(`
@@ -33,22 +33,30 @@ var quarantineDeliveryEvent = redis.NewScript(`
 	`)
 
 type Consumer struct {
-	client       *redis.Client
-	consumerName string
+	client             *redis.Client
+	consumerName       string
+	stream             string
+	deadLetterStream   string
+	group              string
+	pendingIdleTimeout time.Duration
 }
 
 func NewConsumer(client *redis.Client, consumerName string) *Consumer {
 	return &Consumer{
-		client:       client,
-		consumerName: consumerName,
+		client:             client,
+		consumerName:       consumerName,
+		stream:             DeliveryStream,
+		deadLetterStream:   DeliveryDeadLetterStream,
+		group:              ConsumerGroup,
+		pendingIdleTimeout: defaultPendingIdleTimeout,
 	}
 }
 
 func (c *Consumer) CreateGroup(ctx context.Context) error {
 	err := c.client.XGroupCreateMkStream(
 		ctx,
-		DeliveryStream,
-		ConsumerGroup,
+		c.stream,
+		c.group,
 		"0",
 	).Err()
 
@@ -71,9 +79,9 @@ func (c *Consumer) Read(
 	}
 
 	streams, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
-		Group:    ConsumerGroup,
+		Group:    c.group,
 		Consumer: c.consumerName,
-		Streams:  []string{DeliveryStream, ">"},
+		Streams:  []string{c.stream, ">"},
 		Count:    count,
 		Block:    5 * time.Second,
 	}).Result()
@@ -123,10 +131,10 @@ func (c *Consumer) ClaimStale(
 	messages, next, err := c.client.XAutoClaim(
 		ctx,
 		&redis.XAutoClaimArgs{
-			Stream:   DeliveryStream,
-			Group:    ConsumerGroup,
+			Stream:   c.stream,
+			Group:    c.group,
 			Consumer: c.consumerName,
-			MinIdle:  pendingIdleTimeout,
+			MinIdle:  c.pendingIdleTimeout,
 			Start:    start,
 			Count:    count,
 		},
@@ -266,9 +274,9 @@ func (c *Consumer) quarantineMessage(
 	_, err := quarantineDeliveryEvent.Run(
 		ctx,
 		c.client,
-		[]string{DeliveryDeadLetterStream, DeliveryStream},
-		DeliveryStream,
-		ConsumerGroup,
+		[]string{c.deadLetterStream, c.stream},
+		c.stream,
+		c.group,
 		eventID,
 		reason,
 		payload,
@@ -296,8 +304,8 @@ func (c *Consumer) RefreshPending(
 	return c.client.Do(
 		ctx,
 		"XCLAIM",
-		DeliveryStream,
-		ConsumerGroup,
+		c.stream,
+		c.group,
 		c.consumerName,
 		0,
 		eventID,
@@ -316,8 +324,8 @@ func (c *Consumer) Acknowledge(ctx context.Context, eventID string) error {
 	// acknowledged or is no longer pending.
 	return c.client.XAck(
 		ctx,
-		DeliveryStream,
-		ConsumerGroup,
+		c.stream,
+		c.group,
 		eventID,
 	).Err()
 }

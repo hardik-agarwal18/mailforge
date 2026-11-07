@@ -49,8 +49,9 @@ func (p *Processor) Process(
 		return fmt.Errorf("claim recipient: %w", err)
 	}
 
-	// A nil job is returned only for a terminal recipient state (delivered,
-	// bounced, or unknown pending manual reconciliation). It is safe for Worker to acknowledge this duplicate event.
+	// A nil job means the recipient is terminal, including an expired in-flight
+	// lease that ClaimRecipient conservatively reconciled to unknown. It is safe
+	// for Worker to acknowledge this duplicate/stale event.
 	if job == nil {
 		log.Printf(
 			"Recipient is already in a terminal state: recipient=%s event=%s",

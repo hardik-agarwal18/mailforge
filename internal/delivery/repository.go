@@ -75,6 +75,10 @@ func (r *Repository) ClaimRecipient(
 	var job ClaimedDelivery
 	var previousStatus string
 
+	// Only recipients that are definitely safe to start are claimable here.
+	// An expired `delivering` lease is handled below as an ambiguous outcome:
+	// the previous process may have crashed after the remote server accepted
+	// the DATA transaction, so automatically sending again could duplicate mail.
 	err = tx.QueryRow(ctx, `
 		SELECT
 			r.id::text,
@@ -87,21 +91,10 @@ func (r *Repository) ClaimRecipient(
 		FROM recipients r
 		JOIN messages m ON m.id = r.message_id
 		WHERE r.id = $1::uuid
+		  AND r.status IN ('pending', 'deferred')
 		  AND (
-			(
-				r.status IN ('pending', 'deferred')
-				AND (
-					r.next_attempt_at IS NULL
-					OR r.next_attempt_at <= NOW()
-				)
-			)
-			OR (
-				r.status = 'delivering'
-				AND (
-					r.delivery_lease_until IS NULL
-					OR r.delivery_lease_until <= NOW()
-				)
-			)
+			r.next_attempt_at IS NULL
+			OR r.next_attempt_at <= NOW()
 		  )
 		FOR UPDATE OF r
 	`, recipientID).Scan(
@@ -120,7 +113,11 @@ func (r *Repository) ClaimRecipient(
 		var retryPending bool
 		var messageExists bool
 		var retryEventExists bool
+		var leaseExpired bool
+		var attempts int
 
+		// Lock the recipient while deciding whether this event is stale,
+		// scheduled, currently owned, or an abandoned in-flight delivery.
 		lookupErr := tx.QueryRow(ctx, `
 			SELECT
 				r.status,
@@ -139,15 +136,20 @@ func (r *Repository) ClaimRecipient(
 					  AND o.idempotency_key =
 					      'recipient.delivery_requested:' || r.id::text || ':' || (r.attempts + 1)::text
 					  AND o.status IN ('pending', 'publishing', 'published')
-				)
+				),
+				(r.delivery_lease_until IS NULL OR r.delivery_lease_until <= NOW()),
+				r.attempts
 			FROM recipients r
 			WHERE r.id = $1::uuid
+			FOR UPDATE OF r
 		`, recipientID).Scan(
 			&status,
 			&leaseActive,
 			&retryPending,
 			&messageExists,
 			&retryEventExists,
+			&leaseExpired,
+			&attempts,
 		)
 
 		if errors.Is(lookupErr, pgx.ErrNoRows) {
@@ -162,16 +164,23 @@ func (r *Repository) ClaimRecipient(
 
 		switch status {
 		case "delivered", "bounced", "unknown":
-			// Terminal automatic-delivery states. An unknown result requires
-			// operator reconciliation before it can safely be retried.
+			// Terminal automatic-delivery states. In particular, unknown requires
+			// reconciliation before an operator may choose to retry it.
 			return nil, nil
 
 		case "delivering":
 			if leaseActive {
 				return nil, ErrRecipientBusy
 			}
-			// A non-expired or NULL lease should have matched the claim query.
-			// Leave the event pending if the row changes between statements.
+			if leaseExpired {
+				if err := r.markExpiredDeliveryUnknown(ctx, tx, recipientID, attempts); err != nil {
+					return nil, err
+				}
+				if err := tx.Commit(ctx); err != nil {
+					return nil, fmt.Errorf("commit abandoned delivery reconciliation: %w", err)
+				}
+				return nil, nil
+			}
 			return nil, ErrRecipientNotReady
 
 		case "deferred":
@@ -221,16 +230,12 @@ func (r *Repository) ClaimRecipient(
 		return nil, fmt.Errorf("assign delivery lease: %w", err)
 	}
 
-	claimEventType := "attempt_started"
-	if previousStatus == "delivering" {
-		claimEventType = "lease_reclaimed"
-	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO delivery_status_events (
 			recipient_id, from_status, to_status, event_type, diagnostic
 		)
-		VALUES ($1::uuid, $2, 'delivering', $3, 'Worker claimed recipient for SMTP delivery')
-	`, job.RecipientID, previousStatus, claimEventType)
+		VALUES ($1::uuid, $2, 'delivering', 'attempt_started', 'Worker claimed recipient for SMTP delivery')
+	`, job.RecipientID, previousStatus)
 	if err != nil {
 		return nil, fmt.Errorf("record delivery claim status event: %w", err)
 	}
@@ -240,6 +245,64 @@ func (r *Repository) ClaimRecipient(
 	}
 
 	return &job, nil
+}
+
+// markExpiredDeliveryUnknown durably reconciles an abandoned SMTP attempt.
+// SMTP cannot provide exactly-once delivery: a worker may disappear after the
+// remote server accepted DATA but before PostgreSQL committed the result. The
+// safe choice is to stop automatic retries and require manual reconciliation.
+func (r *Repository) markExpiredDeliveryUnknown(
+	ctx context.Context,
+	tx pgx.Tx,
+	recipientID string,
+	attempts int,
+) error {
+	const diagnostic = "delivery lease expired while SMTP outcome was in flight; automatic retry suppressed to avoid duplicate delivery"
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE recipients
+		SET
+			status = 'unknown',
+			next_attempt_at = NULL,
+			unknown_at = NOW(),
+			last_error = $2,
+			delivery_lease_until = NULL,
+			delivery_lease_token = NULL,
+			updated_at = NOW()
+		WHERE id = $1::uuid
+		  AND status = 'delivering'
+		  AND (delivery_lease_until IS NULL OR delivery_lease_until <= NOW())
+	`, recipientID, diagnostic)
+	if err != nil {
+		return fmt.Errorf("mark expired delivery outcome unknown: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("recipient %s changed while reconciling expired delivery lease", recipientID)
+	}
+
+	if attempts > 0 {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO delivery_attempts (
+				recipient_id, attempt_number, status, response, attempted_at
+			)
+			VALUES ($1::uuid, $2, 'unknown', $3, NOW())
+		`, recipientID, attempts, diagnostic)
+		if err != nil {
+			return fmt.Errorf("record abandoned delivery attempt: %w", err)
+		}
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO delivery_status_events (
+			recipient_id, from_status, to_status, event_type, diagnostic
+		)
+		VALUES ($1::uuid, 'delivering', 'unknown', 'lease_expired_ambiguous', $2)
+	`, recipientID, diagnostic)
+	if err != nil {
+		return fmt.Errorf("record abandoned delivery status event: %w", err)
+	}
+
+	return nil
 }
 
 // RenewLease extends only a lease that is still active and owned by this token.
