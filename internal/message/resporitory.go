@@ -121,66 +121,37 @@ func (r *Repository) Create(
 		return "", fmt.Errorf("insert message: %w", err)
 	}
 
-	// 2. Insert recipients and corresponding outbox events.
-	for _, recipient := range msg.Recipients {
-
-		var recipientID string
-
-		err = tx.QueryRow(
-			ctx,
-			`
-			INSERT INTO recipients (
-				message_id,
-				email
-			)
-			VALUES ($1, $2)
-			RETURNING id::text
-			`,
-			messageID,
-			recipient,
-		).Scan(&recipientID)
-
-		if err != nil {
-			return "", fmt.Errorf(
-				"insert recipient: %w",
-				err,
-			)
-		}
-
-		// Record the initial durable delivery state in the same transaction
-		// as the recipient and its outbox event.
-		_, err = tx.Exec(ctx, `
+	// 2. Insert all recipients, initial status events, and outbox events in a
+	// single set-based statement. The CTEs keep the three writes in this
+	// transaction and avoid three SQL round trips per recipient.
+	var recipientRows int64
+	var statusRows int64
+	var outboxRows int64
+	err = tx.QueryRow(ctx, `
+		WITH recipient_input AS (
+			SELECT email
+			FROM unnest($2::text[]) AS input(email)
+		),
+		inserted_recipients AS (
+			INSERT INTO recipients (message_id, email)
+			SELECT $1::uuid, email
+			FROM recipient_input
+			RETURNING id, email
+		),
+		inserted_status_events AS (
 			INSERT INTO delivery_status_events (
 				recipient_id, from_status, to_status, event_type, diagnostic
 			)
-			VALUES ($1::uuid, NULL, 'pending', 'submitted', 'Recipient accepted for delivery')
-		`, recipientID)
-		if err != nil {
-			return "", fmt.Errorf("record initial recipient delivery status: %w", err)
-		}
-
-		// 3. Construct delivery event.
-		event := DeliveryEvent{
-			RecipientID: recipientID,
-			MessageID:   messageID,
-			Email:       recipient,
-		}
-
-		payload, err := json.Marshal(event)
-		if err != nil {
-			return "", fmt.Errorf(
-				"marshal delivery event: %w",
-				err,
-			)
-		}
-
-		idempotencyKey := "recipient.delivery_requested:" +
-			recipientID
-
-		// 4. Insert event into transactional outbox.
-		_, err = tx.Exec(
-			ctx,
-			`
+			SELECT
+				id,
+				NULL,
+				'pending',
+				'submitted',
+				'Recipient accepted for delivery'
+			FROM inserted_recipients
+			RETURNING recipient_id
+		),
+		inserted_outbox_events AS (
 			INSERT INTO outbox_events (
 				event_type,
 				aggregate_type,
@@ -188,21 +159,41 @@ func (r *Repository) Create(
 				idempotency_key,
 				payload
 			)
-			VALUES ($1, $2, $3, $4, $5)
-			`,
-			"recipient.delivery_requested",
-			"recipient",
-			recipientID,
-			idempotencyKey,
-			payload,
+			SELECT
+				'recipient.delivery_requested',
+				'recipient',
+				id,
+				'recipient.delivery_requested:' || id::text,
+				jsonb_build_object(
+					'recipient_id', id::text,
+					'message_id', $1::text,
+					'email', email
+				)
+			FROM inserted_recipients
+			RETURNING id
 		)
-
-		if err != nil {
-			return "", fmt.Errorf(
-				"insert outbox event: %w",
-				err,
-			)
-		}
+		SELECT
+			(SELECT COUNT(*) FROM inserted_recipients),
+			(SELECT COUNT(*) FROM inserted_status_events),
+			(SELECT COUNT(*) FROM inserted_outbox_events)
+	`, messageID, msg.Recipients).Scan(
+		&recipientRows,
+		&statusRows,
+		&outboxRows,
+	)
+	if err != nil {
+		return "", fmt.Errorf("bulk insert recipients and delivery events: %w", err)
+	}
+	if recipientRows != int64(len(msg.Recipients)) ||
+		statusRows != int64(len(msg.Recipients)) ||
+		outboxRows != int64(len(msg.Recipients)) {
+		return "", fmt.Errorf(
+			"bulk insert count mismatch: recipients=%d statuses=%d outbox=%d expected=%d",
+			recipientRows,
+			statusRows,
+			outboxRows,
+			len(msg.Recipients),
+		)
 	}
 
 	// 5. Commit all changes atomically.

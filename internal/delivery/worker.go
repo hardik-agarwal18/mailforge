@@ -13,6 +13,24 @@ import (
 
 const redisPendingHeartbeatInterval = 30 * time.Second
 
+// pendingJob carries the Redis pending-entry heartbeat from the moment an
+// event is read until its processing/acknowledgement path has completed. This
+// includes time spent waiting in the bounded in-memory dispatch queue.
+type pendingJob struct {
+	job           DeliveryJob
+	stopHeartbeat context.CancelFunc
+	heartbeatDone <-chan struct{}
+}
+
+func (j pendingJob) finish() {
+	if j.stopHeartbeat != nil {
+		j.stopHeartbeat()
+	}
+	if j.heartbeatDone != nil {
+		<-j.heartbeatDone
+	}
+}
+
 type Worker struct {
 	consumer    *Consumer
 	processor   *Processor
@@ -53,55 +71,157 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 	go w.runStreamRetention(ctx)
 
-	log.Printf("Delivery worker started with concurrency=%d", w.concurrency)
+	// The queue is deliberately bounded. At most concurrency jobs can wait
+	// in memory in addition to the concurrency jobs currently being processed.
+	// That gives a predictable memory/back-pressure boundary while keeping
+	// the workers fed between Redis polls.
+	jobQueue, stopWorkers := startWorkerPool(
+		w.concurrency,
+		w.concurrency,
+		func(task pendingJob) {
+			w.processJob(ctx, task)
+		},
+	)
+	defer stopWorkers()
+
+	log.Printf(
+		"Delivery worker started with concurrency=%d queue_capacity=%d",
+		w.concurrency,
+		w.concurrency,
+	)
 
 	claimCursor := "0-0"
 
-	for {
-		if ctx.Err() != nil {
-			return nil
+	for ctx.Err() == nil {
+		available := cap(jobQueue) - len(jobQueue)
+		if available < 1 {
+			// All queue slots are occupied. Workers are still consuming; avoid
+			// polling Redis until back-pressure has eased.
+			if !waitContext(ctx, 25*time.Millisecond) {
+				break
+			}
+			continue
 		}
 
 		staleJobs, nextCursor, claimErr := w.consumer.ClaimStale(
 			ctx,
 			claimCursor,
-			10,
+			int64(available),
 		)
 		if nextCursor != "" {
 			claimCursor = nextCursor
 		}
 		if claimErr != nil {
 			if ctx.Err() != nil {
-				return nil
+				break
 			}
 			log.Printf("Failed to recover pending jobs: %v", claimErr)
 		}
 
-		// Process valid events even if a different event in the same batch
-		// could not be quarantined.
-		w.processBatch(ctx, staleJobs)
-
-		if ctx.Err() != nil {
-			return nil
+		if !w.dispatch(ctx, jobQueue, staleJobs) {
+			break
 		}
 
-		jobs, readErr := w.consumer.Read(ctx, 10)
+		if ctx.Err() != nil {
+			break
+		}
+
+		// ClaimStale may have consumed all currently available queue slots.
+		// Read only the remaining capacity so Redis does not hand us a batch
+		// larger than the bounded queue can accept.
+		available = cap(jobQueue) - len(jobQueue)
+		var jobs []DeliveryJob
+		var readErr error
+		if available > 0 {
+			jobs, readErr = w.consumer.Read(ctx, int64(available))
+		}
 		if readErr != nil {
 			if ctx.Err() != nil {
-				return nil
+				break
 			}
 			log.Printf("Failed to read delivery jobs: %v", readErr)
 		}
-		w.processBatch(ctx, jobs)
+		if !w.dispatch(ctx, jobQueue, jobs) {
+			break
+		}
 
-		// Avoid a tight loop during Redis outages. Read normally blocks for up
-		// to five seconds, but XAUTOCLAIM failures do not.
+		// XREADGROUP normally blocks for up to five seconds. If both Redis
+		// recovery and read operations failed immediately, back off to avoid
+		// a hot loop during an outage.
 		if claimErr != nil && readErr != nil && len(staleJobs) == 0 && len(jobs) == 0 {
 			if !waitContext(ctx, time.Second) {
-				return nil
+				break
 			}
 		}
 	}
+
+	return nil
+}
+
+// startWorkerPool creates long-lived workers and a bounded dispatch channel.
+// The caller owns the returned channel and must call stop exactly once.
+func startWorkerPool(
+	workerCount int,
+	queueCapacity int,
+	process func(pendingJob),
+) (chan pendingJob, func()) {
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if queueCapacity < 0 {
+		queueCapacity = 0
+	}
+
+	jobs := make(chan pendingJob, queueCapacity)
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer workers.Done()
+			for job := range jobs {
+				process(job)
+			}
+		}()
+	}
+
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			close(jobs)
+			workers.Wait()
+		})
+	}
+
+	return jobs, stop
+}
+
+func (w *Worker) dispatch(
+	ctx context.Context,
+	queue chan<- pendingJob,
+	jobs []DeliveryJob,
+) bool {
+	for _, job := range jobs {
+		// Start the heartbeat before enqueueing: an event is already in the
+		// Redis PEL, and it must not look abandoned while waiting for a worker.
+		heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+		heartbeatDone := make(chan struct{})
+		go w.keepPendingAlive(heartbeatCtx, job.EventID, heartbeatDone)
+
+		task := pendingJob{
+			job:           job,
+			stopHeartbeat: stopHeartbeat,
+			heartbeatDone: heartbeatDone,
+		}
+
+		select {
+		case queue <- task:
+		case <-ctx.Done():
+			task.finish()
+			return false
+		}
+	}
+	return true
 }
 
 func waitContext(ctx context.Context, duration time.Duration) bool {
@@ -116,36 +236,12 @@ func waitContext(ctx context.Context, duration time.Duration) bool {
 	}
 }
 
-func (w *Worker) processBatch(
-	ctx context.Context,
-	jobs []DeliveryJob,
-) {
-	semaphore := make(chan struct{}, w.concurrency)
-	var wg sync.WaitGroup
-
-loop:
-	for _, job := range jobs {
-		select {
-		case semaphore <- struct{}{}:
-		case <-ctx.Done():
-			break loop
-		}
-
-		wg.Add(1)
-		go func(job DeliveryJob) {
-			defer wg.Done()
-			defer func() { <-semaphore }()
-			w.processJob(ctx, job)
-		}(job)
-	}
-
-	wg.Wait()
-}
-
 func (w *Worker) processJob(
 	ctx context.Context,
-	job DeliveryJob,
+	task pendingJob,
 ) {
+	defer task.finish()
+	job := task.job
 	startedAt := time.Now()
 
 	if w.metrics != nil {
@@ -158,16 +254,7 @@ func (w *Worker) processJob(
 		}()
 	}
 
-	// Keep the Redis PEL entry alive during long SMTP operations. PostgreSQL
-	// lease tokens still decide which worker may actually send/commit.
-	pendingCtx, stopPendingHeartbeat := context.WithCancel(ctx)
-	pendingHeartbeatDone := make(chan struct{})
-	go w.keepPendingAlive(pendingCtx, job.EventID, pendingHeartbeatDone)
-
 	processErr := w.processor.Process(ctx, job)
-
-	stopPendingHeartbeat()
-	<-pendingHeartbeatDone
 
 	if processErr != nil {
 		if errors.Is(processErr, ErrRecipientBusy) {

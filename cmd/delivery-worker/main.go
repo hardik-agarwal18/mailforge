@@ -24,6 +24,7 @@ const (
 	defaultRedisAddr        = "127.0.0.1:6379"
 	defaultMetricsAddr      = "127.0.0.1:9091"
 	defaultWorkerCount      = 3
+	maxWorkerCount          = 512
 	defaultConnectTimeout   = 15 * time.Second
 	defaultOperationTimeout = 30 * time.Second
 	defaultDeliveryTimeout  = 2 * time.Minute
@@ -68,9 +69,10 @@ func run() error {
 		return err
 	}
 
-	if workerConcurrency < 1 {
+	if workerConcurrency < 1 || workerConcurrency > maxWorkerCount {
 		return fmt.Errorf(
-			"DELIVERY_WORKER_CONCURRENCY must be at least 1",
+			"DELIVERY_WORKER_CONCURRENCY must be between 1 and %d",
+			maxWorkerCount,
 		)
 	}
 

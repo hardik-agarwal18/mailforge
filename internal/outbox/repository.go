@@ -111,88 +111,174 @@ func (r *Repository) ClaimBatch(
 	return events, nil
 }
 
-// MarkPublished marks an event as successfully published.
+// MarkPublished marks one event as successfully published.
 func (r *Repository) MarkPublished(
 	ctx context.Context,
 	event Event,
 ) error {
+	return r.MarkPublishedBatch(ctx, []Event{event})
+}
 
-	result, err := r.db.Exec(
-		ctx,
-		`
-		UPDATE outbox_events
-		SET
-			status = 'published',
-			published_at = NOW(),
-			locked_until = NULL,
-			lease_token = NULL,
-			last_error = NULL
-		WHERE
-			id = $1
-			AND status = 'publishing'
-			AND lease_token = $2
-		`,
-		event.ID,
-		event.LeaseToken,
-	)
+// MarkPublishedBatch marks a set of successfully XADDed events in one
+// PostgreSQL round trip. Lease-token matching prevents a stale publisher from
+// changing an event that another publisher has already reclaimed.
+func (r *Repository) MarkPublishedBatch(
+	ctx context.Context,
+	events []Event,
+) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	ids := make([]string, len(events))
+	leaseTokens := make([]string, len(events))
+	for i, event := range events {
+		ids[i] = event.ID
+		leaseTokens[i] = event.LeaseToken
+	}
+
+	rows, err := r.db.Query(ctx, `
+		WITH claimed AS (
+			SELECT id, lease_token
+			FROM unnest($1::text[], $2::text[]) AS input(id, lease_token)
+		), updated AS (
+			UPDATE outbox_events AS event
+			SET
+				status = 'published',
+				published_at = NOW(),
+				locked_until = NULL,
+				lease_token = NULL,
+				last_error = NULL
+			FROM claimed
+			WHERE event.id = claimed.id::uuid
+			  AND event.lease_token = claimed.lease_token::uuid
+			  AND event.status = 'publishing'
+			RETURNING event.id
+		)
+		SELECT id::text FROM updated
+	`, ids, leaseTokens)
 	if err != nil {
-		return fmt.Errorf("mark published: %w", err)
+		return fmt.Errorf("mark published batch: %w", err)
 	}
+	defer rows.Close()
 
-	if result.RowsAffected() != 1 {
-		return fmt.Errorf("event lease lost: %s", event.ID)
+	updatedCount := 0
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("scan published outbox event: %w", err)
+		}
+		updatedCount++
 	}
-
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate published outbox events: %w", err)
+	}
+	if updatedCount != len(events) {
+		return fmt.Errorf(
+			"published %d of %d outbox events; one or more leases were lost",
+			updatedCount,
+			len(events),
+		)
+	}
 	return nil
 }
 
-// MarkFailed schedules a retry or moves the event to dead status.
+// MarkFailed schedules a retry or moves an event to dead status.
 func (r *Repository) MarkFailed(
 	ctx context.Context,
 	event Event,
 	publishErr error,
 ) error {
+	return r.MarkFailedBatch(ctx, []Event{event}, []error{publishErr})
+}
 
-	nextStatus := "pending"
-
-	if event.Attempts >= 10 {
-		nextStatus = "dead"
+// MarkFailedBatch schedules failed pipeline commands in one PostgreSQL
+// statement while retaining per-event retry delays and diagnostics.
+func (r *Repository) MarkFailedBatch(
+	ctx context.Context,
+	events []Event,
+	publishErrors []error,
+) error {
+	if len(events) == 0 {
+		return nil
+	}
+	if len(events) != len(publishErrors) {
+		return fmt.Errorf("failed outbox event/error count mismatch: %d != %d", len(events), len(publishErrors))
 	}
 
-	delaySeconds := 1 << min(event.Attempts, 8)
-	if delaySeconds > 300 {
-		delaySeconds = 300
+	ids := make([]string, len(events))
+	leaseTokens := make([]string, len(events))
+	delays := make([]int32, len(events))
+	errorsText := make([]string, len(events))
+	statuses := make([]string, len(events))
+	for i, event := range events {
+		ids[i] = event.ID
+		leaseTokens[i] = event.LeaseToken
+		delay := 1 << min(event.Attempts, 8)
+		if delay > 300 {
+			delay = 300
+		}
+		delays[i] = int32(delay)
+		statuses[i] = "pending"
+		if event.Attempts >= 10 {
+			statuses[i] = "dead"
+		}
+		if publishErrors[i] != nil {
+			errorsText[i] = publishErrors[i].Error()
+		} else {
+			errorsText[i] = "unknown Redis publishing error"
+		}
 	}
 
-	result, err := r.db.Exec(
-		ctx,
-		`
-		UPDATE outbox_events
-		SET
-			status = $3,
-			available_at = NOW() + make_interval(secs => $4),
-			locked_until = NULL,
-			lease_token = NULL,
-			last_error = $5
-		WHERE
-			id = $1
-			AND status = 'publishing'
-			AND lease_token = $2
-		`,
-		event.ID,
-		event.LeaseToken,
-		nextStatus,
-		delaySeconds,
-		publishErr.Error(),
-	)
+	rows, err := r.db.Query(ctx, `
+		WITH failures AS (
+			SELECT id, lease_token, next_status, delay_seconds, last_error
+			FROM unnest(
+				$1::text[],
+				$2::text[],
+				$3::text[],
+				$4::integer[],
+				$5::text[]
+			) AS input(id, lease_token, next_status, delay_seconds, last_error)
+		), updated AS (
+			UPDATE outbox_events AS event
+			SET
+				status = failures.next_status,
+				available_at = NOW() + make_interval(secs => failures.delay_seconds),
+				locked_until = NULL,
+				lease_token = NULL,
+				last_error = failures.last_error
+			FROM failures
+			WHERE event.id = failures.id::uuid
+			  AND event.lease_token = failures.lease_token::uuid
+			  AND event.status = 'publishing'
+			RETURNING event.id
+		)
+		SELECT id::text FROM updated
+	`, ids, leaseTokens, statuses, delays, errorsText)
 	if err != nil {
-		return fmt.Errorf("mark failed: %w", err)
+		return fmt.Errorf("mark failed outbox batch: %w", err)
 	}
+	defer rows.Close()
 
-	if result.RowsAffected() != 1 {
-		return fmt.Errorf("event lease lost while marking failure: %s", event.ID)
+	updatedCount := 0
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("scan failed outbox event: %w", err)
+		}
+		updatedCount++
 	}
-
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate failed outbox events: %w", err)
+	}
+	if updatedCount != len(events) {
+		return fmt.Errorf(
+			"updated %d of %d failed outbox events; one or more leases were lost",
+			updatedCount,
+			len(events),
+		)
+	}
 	return nil
 }
 

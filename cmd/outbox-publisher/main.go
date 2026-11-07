@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -77,6 +78,16 @@ func main() {
 		repository,
 		redisClient,
 	)
+
+	batchSize := 50
+	if rawBatchSize := os.Getenv("OUTBOX_PUBLISH_BATCH_SIZE"); rawBatchSize != "" {
+		parsedBatchSize, parseErr := strconv.Atoi(rawBatchSize)
+		if parseErr != nil || parsedBatchSize < 1 || parsedBatchSize > 1000 {
+			log.Fatalf("OUTBOX_PUBLISH_BATCH_SIZE must be an integer between 1 and 1000")
+		}
+		batchSize = parsedBatchSize
+	}
+	publisher.SetBatchSize(batchSize)
 
 	publisher.Run(ctx)
 }
