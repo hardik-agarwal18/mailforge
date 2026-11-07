@@ -232,7 +232,11 @@ func TestSubmissionRequiresTLSAndAuthenticationAndBindsSender(t *testing.T) {
 
 	writeCommand(t, tlsClient, "DATA")
 	assertCode(t, readReply(t, reader), "354")
-	if _, err := tlsClient.Write([]byte("Subject: Submission test\r\n\r\nHello\r\n.\r\n")); err != nil {
+	if _, err := tlsClient.Write([]byte("To: visible@example.net\r\n" +
+		"Cc: copy@example.org\r\n" +
+		"Bcc: blind@example.com\r\n" +
+		"Reply-To: replies@example.net\r\n" +
+		"Subject: Submission test\r\n\r\nHello\r\n.\r\n")); err != nil {
 		t.Fatalf("write DATA: %v", err)
 	}
 	assertCode(t, readReply(t, reader), "250")
@@ -250,6 +254,9 @@ func TestSubmissionRequiresTLSAndAuthenticationAndBindsSender(t *testing.T) {
 	}
 	if len(acceptor.input.Recipients) != 1 || acceptor.input.Recipients[0] != "recipient@example.net" {
 		t.Fatalf("stored recipients = %v", acceptor.input.Recipients)
+	}
+	if !strings.Contains(string(acceptor.input.RawMessage), "Bcc: blind@example.com") {
+		t.Fatal("SMTP acceptance should preserve the original Bcc header for internal parsing/storage")
 	}
 	if metrics.opened != 1 || metrics.closed != 1 {
 		t.Fatalf("connection metrics opened=%d closed=%d", metrics.opened, metrics.closed)

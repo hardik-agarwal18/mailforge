@@ -323,3 +323,93 @@ func TestParsePreservesQuotedLocalPartsInAddressHeaders(t *testing.T) {
 		t.Fatalf("From = %#v, quoted local-part was not preserved", parsed.From)
 	}
 }
+
+func TestParseToCcBccAndReplyToHeaders(t *testing.T) {
+	raw := []byte("From: Sender <sender@example.com>\r\n" +
+		"To: Primary <primary@example.net>, second@example.net\r\n" +
+		"Cc: Copy <copy@example.org>\r\n" +
+		"Bcc: Blind <blind@example.com>\r\n" +
+		"Reply-To: Replies <replies@example.net>\r\n" +
+		"Subject: Address fields\r\n\r\nhello\r\n")
+
+	parsed, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(parsed.To) != 2 || parsed.To[0].Address != "primary@example.net" || parsed.To[1].Address != "second@example.net" {
+		t.Fatalf("To = %#v", parsed.To)
+	}
+	if len(parsed.Cc) != 1 || parsed.Cc[0].Address != "copy@example.org" {
+		t.Fatalf("Cc = %#v", parsed.Cc)
+	}
+	if len(parsed.Bcc) != 1 || parsed.Bcc[0].Address != "blind@example.com" {
+		t.Fatalf("Bcc = %#v", parsed.Bcc)
+	}
+	if len(parsed.ReplyTo) != 1 || parsed.ReplyTo[0].Address != "replies@example.net" {
+		t.Fatalf("Reply-To = %#v", parsed.ReplyTo)
+	}
+}
+
+func TestParseAllowsEmptyBccHeader(t *testing.T) {
+	parsed, err := Parse([]byte("From: sender@example.com\r\nBcc:\r\n\r\nbody\r\n"))
+	if err != nil {
+		t.Fatalf("Parse() rejected an empty Bcc header: %v", err)
+	}
+	if len(parsed.Bcc) != 0 {
+		t.Fatalf("Bcc = %#v, want no addresses", parsed.Bcc)
+	}
+}
+
+func TestParseRejectsInvalidMailboxInEachDestinationHeader(t *testing.T) {
+	for _, header := range []string{"To", "Cc", "Bcc", "Reply-To"} {
+		t.Run(header, func(t *testing.T) {
+			raw := []byte("From: sender@example.com\r\n" + header + ": invalid@@example.net\r\n\r\nbody\r\n")
+			if _, err := Parse(raw); err == nil {
+				t.Fatalf("Parse() accepted invalid mailbox in %s", header)
+			}
+		})
+	}
+}
+
+func TestStripBccHeadersRemovesFieldsAndFoldedLines(t *testing.T) {
+	raw := []byte("From: sender@example.com\r\n" +
+		"To: visible@example.net\r\n" +
+		"Bcc: hidden-one@example.com,\r\n\t hidden-two@example.com\r\n" +
+		"Subject: retained\r\n" +
+		"Resent-Bcc: resent-hidden@example.org\r\n" +
+		"Reply-To: replies@example.net\r\n\r\n" +
+		"Body mentions Bcc: but this is not a header.\r\n")
+
+	got, err := StripBccHeaders(raw)
+	if err != nil {
+		t.Fatalf("StripBccHeaders() error = %v", err)
+	}
+	want := []byte("From: sender@example.com\r\n" +
+		"To: visible@example.net\r\n" +
+		"Subject: retained\r\n" +
+		"Reply-To: replies@example.net\r\n\r\n" +
+		"Body mentions Bcc: but this is not a header.\r\n")
+	if string(got) != string(want) {
+		t.Fatalf("sanitized message = %q, want %q", got, want)
+	}
+	if strings.Contains(string(got), "hidden-one@example.com") || strings.Contains(string(got), "resent-hidden@example.org") {
+		t.Fatal("sanitized message leaked a blind-copy address")
+	}
+}
+
+func TestStripBccHeadersPreservesMessageWithoutBcc(t *testing.T) {
+	raw := []byte("From: sender@example.com\r\nTo: recipient@example.net\r\n\r\nbody\r\n")
+	got, err := StripBccHeaders(raw)
+	if err != nil {
+		t.Fatalf("StripBccHeaders() error = %v", err)
+	}
+	if string(got) != string(raw) {
+		t.Fatalf("message changed without Bcc header: got %q want %q", got, raw)
+	}
+}
+
+func TestStripBccHeadersRejectsMissingSeparator(t *testing.T) {
+	if _, err := StripBccHeaders([]byte("Bcc: hidden@example.com\r\n")); err == nil {
+		t.Fatal("StripBccHeaders() accepted a message without header/body separator")
+	}
+}

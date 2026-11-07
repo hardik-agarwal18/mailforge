@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"mailforge/internal/emailaddr"
+	"mailforge/internal/mimeparser"
 )
 
 func (c *Client) Send(
@@ -28,6 +29,14 @@ func (c *Client) Send(
 		return &DeliveryError{Message: fmt.Sprintf("invalid envelope recipient: %v", err), Permanent: true}
 	}
 
+	// Bcc addresses are carried in the SMTP envelope (RCPT TO), not exposed
+	// in the message data sent to any recipient. Strip both ordinary and
+	// resent Bcc header fields from every per-recipient delivery copy.
+	deliveryMessage, err := mimeparser.StripBccHeaders(rawMessage)
+	if err != nil {
+		return &DeliveryError{Message: fmt.Sprintf("invalid message headers: %v", err), Permanent: true}
+	}
+
 	deliveryCtx, cancel := context.WithTimeout(ctx, c.config.DeliveryTimeout)
 	defer cancel()
 
@@ -40,7 +49,7 @@ func (c *Client) Send(
 			net.JoinHostPort(c.config.RelayHost, fmt.Sprintf("%d", c.config.RelayPort)),
 			sender,
 			recipient,
-			rawMessage,
+			deliveryMessage,
 		)
 	}
 
@@ -74,7 +83,7 @@ func (c *Client) Send(
 				dialAddress,
 				sender,
 				recipient,
-				rawMessage,
+				deliveryMessage,
 			)
 			if err == nil {
 				return nil

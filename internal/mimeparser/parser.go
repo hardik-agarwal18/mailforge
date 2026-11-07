@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"mailforge/internal/emailaddr"
 )
 
 const (
@@ -234,28 +236,44 @@ func (p *parser) parseMessageHeaders(h mail.Header) error {
 		p.result.Subject = subjectValue
 	}
 
-	for key, dst := range map[string]*[]Address{
-		"From":     &p.result.From,
-		"Sender":   &p.result.Sender,
-		"Reply-To": &p.result.ReplyTo,
-		"To":       &p.result.To,
-		"Cc":       &p.result.Cc,
-		"Bcc":      &p.result.Bcc,
-	} {
-		values := h[textproto.CanonicalMIMEHeaderKey(key)]
+	// Keep this order deterministic so malformed messages always produce the
+	// same first validation error. Header addresses are parsed for mailbox
+	// metadata; the SMTP RCPT TO envelope remains authoritative for delivery.
+	addressHeaders := []struct {
+		name string
+		dst  *[]Address
+	}{
+		{name: "From", dst: &p.result.From},
+		{name: "Sender", dst: &p.result.Sender},
+		{name: "Reply-To", dst: &p.result.ReplyTo},
+		{name: "To", dst: &p.result.To},
+		{name: "Cc", dst: &p.result.Cc},
+		{name: "Bcc", dst: &p.result.Bcc},
+	}
+	for _, field := range addressHeaders {
+		values := h[textproto.CanonicalMIMEHeaderKey(field.name)]
 		if len(values) == 0 {
 			continue
 		}
 		if len(values) > 1 {
-			return fmt.Errorf("%w: duplicate %s header", ErrMalformedMessage, key)
+			return fmt.Errorf("%w: duplicate %s header", ErrMalformedMessage, field.name)
 		}
 		joined := strings.Join(values, ",")
+		// RFC 5322 permits an empty Bcc field. It carries no recipient and is
+		// retained only as an empty parsed list; outbound copies still strip it.
+		if field.name == "Bcc" && strings.TrimSpace(joined) == "" {
+			continue
+		}
 		addresses, parseErr := (&mail.AddressParser{WordDecoder: newWordDecoder()}).ParseList(joined)
 		if parseErr != nil {
-			return fmt.Errorf("%w: invalid %s header: %v", ErrMalformedMessage, key, parseErr)
+			return fmt.Errorf("%w: invalid %s header: %v", ErrMalformedMessage, field.name, parseErr)
 		}
 		for _, address := range addresses {
-			*dst = append(*dst, Address{Name: address.Name, Address: formatAddrSpec(address.Address)})
+			addrSpec := formatAddrSpec(address.Address)
+			if validateErr := emailaddr.ValidateMailbox(addrSpec); validateErr != nil {
+				return fmt.Errorf("%w: invalid mailbox in %s header: %v", ErrMalformedMessage, field.name, validateErr)
+			}
+			*field.dst = append(*field.dst, Address{Name: address.Name, Address: addrSpec})
 		}
 	}
 

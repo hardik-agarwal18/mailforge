@@ -169,3 +169,38 @@ func TestAcceptRejectsMIMELimitViolation(t *testing.T) {
 		t.Fatalf("repository Create called %d times for oversized MIME", creator.calls)
 	}
 }
+
+func TestAcceptStoresToCcBccAndReplyToMetadata(t *testing.T) {
+	creator := &recordingCreator{}
+	service := NewService(creator)
+	raw := []byte("From: sender@example.com\r\n" +
+		"To: primary@example.net\r\n" +
+		"Cc: copy@example.org\r\n" +
+		"Bcc: blind@example.com\r\n" +
+		"Reply-To: replies@example.net\r\n\r\nbody\r\n")
+
+	stored, err := service.Accept(context.Background(), NewMessage{
+		Sender: "sender@example.com", Recipients: []string{"primary@example.net", "copy@example.org", "blind@example.com"}, RawMessage: raw,
+	})
+	if err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	if stored.Parsed == nil {
+		t.Fatal("stored message has no parsed metadata")
+	}
+	if len(stored.Parsed.To) != 1 || stored.Parsed.To[0].Address != "primary@example.net" {
+		t.Fatalf("To metadata = %#v", stored.Parsed.To)
+	}
+	if len(stored.Parsed.Cc) != 1 || stored.Parsed.Cc[0].Address != "copy@example.org" {
+		t.Fatalf("Cc metadata = %#v", stored.Parsed.Cc)
+	}
+	if len(stored.Parsed.Bcc) != 1 || stored.Parsed.Bcc[0].Address != "blind@example.com" {
+		t.Fatalf("Bcc metadata = %#v", stored.Parsed.Bcc)
+	}
+	if len(stored.Parsed.ReplyTo) != 1 || stored.Parsed.ReplyTo[0].Address != "replies@example.net" {
+		t.Fatalf("Reply-To metadata = %#v", stored.Parsed.ReplyTo)
+	}
+	if string(stored.RawMessage) != string(raw) {
+		t.Fatal("original message was modified; raw storage must retain the Bcc header")
+	}
+}
