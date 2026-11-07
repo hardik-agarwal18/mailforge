@@ -82,3 +82,87 @@ groups:
         annotations:
           summary: "PostgreSQL deadlocks detected"
           description: "PostgreSQL is reporting deadlocks."
+
+  - name: mailforge-application-alerts
+    rules:
+      - alert: MailForgeOutboxBacklogOld
+        expr: max(mailforge_outbox_oldest_pending_age_seconds{job="mailforge-outbox-publisher"}) > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MailForge outbox publication is falling behind"
+          description: "The oldest due outbox event has been waiting for publication for more than 60 seconds."
+
+      - alert: MailForgeDeadOutboxEvents
+        expr: max(mailforge_outbox_dead_events{job="mailforge-outbox-publisher"}) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MailForge has dead outbox events"
+          description: "One or more outbox events exhausted automatic retries and require operator inspection."
+
+      - alert: MailForgeOutboxPublisherDown
+        expr: up{job="mailforge-outbox-publisher"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "MailForge outbox publisher metrics endpoint is unavailable"
+          description: "Prometheus cannot scrape the outbox publisher. Publication may be stopped."
+
+      - alert: MailForgeApplicationPostgresPoolSaturated
+        expr: |
+          (
+            mailforge_postgres_pool_acquired_connections
+            /
+            clamp_min(mailforge_postgres_pool_max_connections, 1)
+          ) > 0.85
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A MailForge PostgreSQL connection pool is nearly saturated"
+          description: "An application pool has used more than 85% of its configured connections for two minutes."
+
+      - alert: MailForgePostgresPoolWaitPressure
+        expr: max by (job) (deriv(mailforge_postgres_pool_empty_acquire_wait_seconds[5m])) > 0.10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MailForge application is waiting for PostgreSQL connections"
+          description: "An application pool has spent more than 10% of process time waiting for an available connection over the recent five-minute window."
+
+      - alert: MailForgeDeliveryQueueSaturated
+        expr: |
+          (
+            mailforge_delivery_queue_depth
+            /
+            clamp_min(mailforge_delivery_queue_capacity, 1)
+          ) > 0.90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MailForge delivery worker queue is saturated"
+          description: "The in-memory delivery queue has remained above 90% capacity for five minutes."
+
+      - alert: MailForgeDeliveryLeaseRenewalFailures
+        expr: increase(mailforge_delivery_lease_renewal_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MailForge failed to renew a delivery lease"
+          description: "A delivery lease renewal failed. The affected SMTP operation may have been canceled."
+
+      - alert: MailForgeRedisOperationFailures
+        expr: increase(mailforge_redis_operation_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MailForge Redis operations are failing"
+          description: "A Redis queue, acknowledgement, heartbeat or metrics operation failed in the last five minutes."

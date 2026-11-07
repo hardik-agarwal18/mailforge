@@ -39,6 +39,7 @@ func (w *Worker) updateRedisMetrics(ctx context.Context) {
 	// Total retained stream entries.
 	streamEntries, err := client.XLen(ctx, DeliveryStream).Result()
 	if err != nil {
+		w.metrics.RedisOperationFailuresTotal.WithLabelValues("metrics_xlen").Inc()
 		log.Printf("Redis metrics: XLEN failed: %v", err)
 		return
 	}
@@ -48,6 +49,7 @@ func (w *Worker) updateRedisMetrics(ctx context.Context) {
 	// Consumer group information.
 	groups, err := client.XInfoGroups(ctx, DeliveryStream).Result()
 	if err != nil {
+		w.metrics.RedisOperationFailuresTotal.WithLabelValues("metrics_xinfo_groups").Inc()
 		log.Printf("Redis metrics: XINFO GROUPS failed: %v", err)
 		return
 	}
@@ -67,6 +69,10 @@ func (w *Worker) updateRedisMetrics(ctx context.Context) {
 		// Redis can report -1 when lag is unavailable.
 		if group.Lag >= 0 {
 			w.metrics.RedisConsumerGroupLag.Set(float64(group.Lag))
+		} else {
+			// Redis reports -1 when lag cannot be determined (for example, when
+			// the stream has been trimmed in a way that hides the last-delivered ID).
+			w.metrics.RedisConsumerGroupLag.Set(-1)
 		}
 
 		// No pending messages means no pending idle time.
@@ -88,6 +94,7 @@ func (w *Worker) updateRedisMetrics(ctx context.Context) {
 		).Result()
 
 		if err != nil {
+			w.metrics.RedisOperationFailuresTotal.WithLabelValues("metrics_xpending").Inc()
 			log.Printf("Redis metrics: XPENDING failed: %v", err)
 			return
 		}
@@ -105,6 +112,10 @@ func (w *Worker) updateRedisMetrics(ctx context.Context) {
 	}
 
 	if !groupFound {
+		w.metrics.RedisPendingMessages.Set(0)
+		w.metrics.RedisConsumers.Set(0)
+		w.metrics.RedisConsumerGroupLag.Set(0)
+		w.metrics.RedisOldestPendingIdle.Set(0)
 		log.Printf(
 			"Redis metrics: consumer group %q not found",
 			ConsumerGroup,

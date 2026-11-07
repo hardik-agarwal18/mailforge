@@ -13,6 +13,42 @@ type Repository struct {
 	db *pgxpool.Pool
 }
 
+type QueueStats struct {
+	Pending              int64
+	Publishing           int64
+	Dead                 int64
+	OldestPendingAgeSecs float64
+}
+
+// QueueStats returns a lightweight operational snapshot for Prometheus.
+// OldestPendingAgeSecs includes only pending events that are currently due;
+// deliberately delayed retries do not make the publisher look unhealthy.
+func (r *Repository) QueueStats(ctx context.Context) (QueueStats, error) {
+	var stats QueueStats
+	err := r.db.QueryRow(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM outbox_events WHERE status = 'pending'),
+			(SELECT COUNT(*) FROM outbox_events WHERE status = 'publishing'),
+			(SELECT COUNT(*) FROM outbox_events WHERE status = 'dead'),
+			COALESCE((
+				SELECT EXTRACT(EPOCH FROM (NOW() - created_at))::double precision
+				FROM outbox_events
+				WHERE status = 'pending' AND available_at <= NOW()
+				ORDER BY created_at ASC
+				LIMIT 1
+			), 0::double precision)
+	`).Scan(
+		&stats.Pending,
+		&stats.Publishing,
+		&stats.Dead,
+		&stats.OldestPendingAgeSecs,
+	)
+	if err != nil {
+		return QueueStats{}, fmt.Errorf("collect outbox queue stats: %w", err)
+	}
+	return stats, nil
+}
+
 func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
 }

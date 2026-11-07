@@ -85,6 +85,9 @@ func (p *Processor) Process(
 	)
 
 	startedAt := time.Now()
+	if p.metrics != nil {
+		p.metrics.DeliveryAttemptsInFlight.Inc()
+	}
 	var transportInfo outbound.DeliveryInfo
 	var sendErr error
 	if detailedSender, ok := p.sender.(DetailedSender); ok {
@@ -103,6 +106,9 @@ func (p *Processor) Process(
 		)
 	}
 	duration := time.Since(startedAt)
+	if p.metrics != nil {
+		p.metrics.DeliveryAttemptsInFlight.Dec()
+	}
 
 	// Stop the heartbeat and wait for any in-flight renewal to finish before
 	// committing the outcome.
@@ -139,6 +145,9 @@ func (p *Processor) Process(
 
 	var deliveryErr *outbound.DeliveryError
 	if !errors.As(sendErr, &deliveryErr) {
+		if p.metrics != nil {
+			p.metrics.RecordDeliveryFailure("unknown", "unclassified")
+		}
 		// Leave the Redis event pending. A generic error has no reliable SMTP
 		// classification; do not fabricate a permanent/temporary result.
 		return fmt.Errorf("unclassified delivery failure: %w", sendErr)
@@ -167,6 +176,7 @@ func (p *Processor) Process(
 	if deliveryErr.Ambiguous {
 		if p.metrics != nil {
 			p.metrics.RecordDeliveryAttempt(duration, "unknown")
+			p.metrics.RecordDeliveryFailure(deliveryErr.Stage, "ambiguous")
 		}
 		return p.repository.RecordUnknownOutcome(outcomeCtx, job, deliveryErr.Message, details)
 	}
@@ -174,6 +184,7 @@ func (p *Processor) Process(
 	if deliveryErr.Permanent {
 		if p.metrics != nil {
 			p.metrics.RecordDeliveryAttempt(duration, "permanent_failure")
+			p.metrics.RecordDeliveryFailure(deliveryErr.Stage, "permanent")
 		}
 		return p.repository.RecordPermanentFailureWithDetails(
 			outcomeCtx,
@@ -186,6 +197,7 @@ func (p *Processor) Process(
 
 	if p.metrics != nil {
 		p.metrics.RecordDeliveryAttempt(duration, "temporary_failure")
+		p.metrics.RecordDeliveryFailure(deliveryErr.Stage, "temporary")
 	}
 
 	return p.repository.RecordTemporaryFailureWithDetails(
@@ -230,6 +242,9 @@ func (p *Processor) maintainLease(
 			renewCancel()
 
 			if err != nil {
+				if p.metrics != nil {
+					p.metrics.DeliveryLeaseRenewFailures.Inc()
+				}
 				select {
 				case leaseErr <- err:
 				default:

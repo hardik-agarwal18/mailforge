@@ -49,6 +49,7 @@ func main() {
 	messageService := message.NewService(messageRepository)
 
 	metrics := observability.NewMetrics()
+	go observability.CollectPostgresPoolMetrics(context.Background(), pool, metrics, 5*time.Second)
 
 	metricsAddr := os.Getenv("METRICS_ADDR")
 	if metricsAddr == "" {

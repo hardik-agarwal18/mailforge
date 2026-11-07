@@ -18,6 +18,7 @@ const redisPendingHeartbeatInterval = 30 * time.Second
 // includes time spent waiting in the bounded in-memory dispatch queue.
 type pendingJob struct {
 	job           DeliveryJob
+	enqueuedAt    time.Time
 	stopHeartbeat context.CancelFunc
 	heartbeatDone <-chan struct{}
 }
@@ -83,6 +84,10 @@ func (w *Worker) Run(ctx context.Context) error {
 		},
 	)
 	defer stopWorkers()
+	if w.metrics != nil {
+		w.metrics.SetWorkerPoolStats(w.concurrency, 0, cap(jobQueue))
+		go w.collectWorkerQueueMetrics(ctx, jobQueue, time.Second)
+	}
 
 	log.Printf(
 		"Delivery worker started with concurrency=%d queue_capacity=%d",
@@ -112,10 +117,15 @@ func (w *Worker) Run(ctx context.Context) error {
 			claimCursor = nextCursor
 		}
 		if claimErr != nil {
+			if w.metrics != nil {
+				w.metrics.RedisOperationFailuresTotal.WithLabelValues("claim_stale").Inc()
+			}
 			if ctx.Err() != nil {
 				break
 			}
 			log.Printf("Failed to recover pending jobs: %v", claimErr)
+		} else if w.metrics != nil && len(staleJobs) > 0 {
+			w.metrics.RedisMessagesReclaimed.Add(float64(len(staleJobs)))
 		}
 
 		if !w.dispatch(ctx, jobQueue, staleJobs) {
@@ -136,6 +146,9 @@ func (w *Worker) Run(ctx context.Context) error {
 			jobs, readErr = w.consumer.Read(ctx, int64(available))
 		}
 		if readErr != nil {
+			if w.metrics != nil {
+				w.metrics.RedisOperationFailuresTotal.WithLabelValues("read").Inc()
+			}
 			if ctx.Err() != nil {
 				break
 			}
@@ -210,18 +223,42 @@ func (w *Worker) dispatch(
 
 		task := pendingJob{
 			job:           job,
+			enqueuedAt:    time.Now(),
 			stopHeartbeat: stopHeartbeat,
 			heartbeatDone: heartbeatDone,
 		}
 
 		select {
 		case queue <- task:
+			if w.metrics != nil {
+				w.metrics.DeliveryJobsEnqueuedTotal.Inc()
+				w.metrics.DeliveryQueueDepth.Set(float64(len(queue)))
+			}
 		case <-ctx.Done():
 			task.finish()
 			return false
 		}
 	}
 	return true
+}
+
+func (w *Worker) collectWorkerQueueMetrics(ctx context.Context, queue <-chan pendingJob, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if w.metrics != nil {
+				w.metrics.DeliveryQueueDepth.Set(float64(len(queue)))
+				w.metrics.DeliveryQueueCapacity.Set(float64(cap(queue)))
+			}
+		}
+	}
 }
 
 func waitContext(ctx context.Context, duration time.Duration) bool {
@@ -245,6 +282,9 @@ func (w *Worker) processJob(
 	startedAt := time.Now()
 
 	if w.metrics != nil {
+		if !task.enqueuedAt.IsZero() {
+			w.metrics.DeliveryJobQueueWait.Observe(time.Since(task.enqueuedAt).Seconds())
+		}
 		w.metrics.DeliveryJobsActive.Inc()
 		defer w.metrics.DeliveryJobsActive.Dec()
 		defer func() {
@@ -258,6 +298,9 @@ func (w *Worker) processJob(
 
 	if processErr != nil {
 		if errors.Is(processErr, ErrRecipientBusy) {
+			if w.metrics != nil {
+				w.metrics.DeliveryJobsTotal.WithLabelValues("recipient_busy").Inc()
+			}
 			log.Printf(
 				"Recipient is owned by another worker; leaving event pending: event=%s",
 				job.EventID,
@@ -266,6 +309,9 @@ func (w *Worker) processJob(
 		}
 
 		if errors.Is(processErr, ErrRecipientNotReady) {
+			if w.metrics != nil {
+				w.metrics.DeliveryJobsTotal.WithLabelValues("recipient_not_ready").Inc()
+			}
 			log.Printf(
 				"Recipient is not ready; leaving event pending: event=%s",
 				job.EventID,
@@ -289,8 +335,14 @@ func (w *Worker) processJob(
 				processErr.Error(),
 				payload,
 			); err != nil {
+				if w.metrics != nil {
+					w.metrics.RedisOperationFailuresTotal.WithLabelValues("quarantine").Inc()
+				}
 				log.Printf("Failed to quarantine orphan event %s: %v", job.EventID, err)
 				return
+			}
+			if w.metrics != nil {
+				w.metrics.DeliveryJobsTotal.WithLabelValues("quarantined").Inc()
 			}
 			log.Printf("Quarantined orphan delivery event %s", job.EventID)
 			return
@@ -313,6 +365,7 @@ func (w *Worker) processJob(
 func (w *Worker) acknowledge(ctx context.Context, eventID string) {
 	if err := w.consumer.Acknowledge(ctx, eventID); err != nil {
 		if w.metrics != nil {
+			w.metrics.RedisOperationFailuresTotal.WithLabelValues("acknowledge").Inc()
 			w.metrics.DeliveryJobsTotal.
 				WithLabelValues("acknowledgement_error").
 				Inc()
@@ -348,6 +401,9 @@ func (w *Worker) keepPendingAlive(
 			err := w.consumer.RefreshPending(heartbeatCtx, eventID)
 			cancel()
 			if err != nil {
+				if w.metrics != nil {
+					w.metrics.RedisOperationFailuresTotal.WithLabelValues("pending_heartbeat").Inc()
+				}
 				// Do not cancel SMTP solely because Redis PEL maintenance failed.
 				// PostgreSQL lease ownership remains the safety boundary.
 				log.Printf("Redis pending heartbeat failed: event=%s error=%v", eventID, err)

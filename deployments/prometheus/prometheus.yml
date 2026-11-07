@@ -27,6 +27,11 @@ scrape_configs:
       - targets:
           - "host.docker.internal:9092"
 
+  - job_name: "mailforge-outbox-publisher"
+    static_configs:
+      - targets:
+          - "host.docker.internal:9096"
+
   - job_name: "mailforge-smtp-submission"
     static_configs:
       - targets:

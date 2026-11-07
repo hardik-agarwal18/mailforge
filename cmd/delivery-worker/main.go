@@ -175,6 +175,7 @@ func run() error {
 	// --------------------------------------------------
 
 	metrics := observability.NewMetrics()
+	go observability.CollectPostgresPoolMetrics(ctx, db, metrics, 5*time.Second)
 
 	metricsServer := &http.Server{
 		Addr:              metricsAddr,
@@ -381,12 +382,23 @@ func run() error {
 	// Run worker
 	// --------------------------------------------------
 
-	if err := worker.Run(ctx); err != nil {
-		return fmt.Errorf("delivery worker failed: %w", err)
+	workerErr := make(chan error, 1)
+	go func() { workerErr <- worker.Run(ctx) }()
+
+	select {
+	case metricsErr := <-metricsServerErrors:
+		stop()
+		if workerShutdownErr := <-workerErr; workerShutdownErr != nil {
+			return fmt.Errorf("metrics server failed: %v; worker shutdown failed: %w", metricsErr, workerShutdownErr)
+		}
+		return fmt.Errorf("delivery worker metrics server failed: %w", metricsErr)
+	case err := <-workerErr:
+		if err != nil {
+			return fmt.Errorf("delivery worker failed: %w", err)
+		}
 	}
 
 	log.Println("MailForge delivery worker stopped gracefully")
-
 	return nil
 }
 

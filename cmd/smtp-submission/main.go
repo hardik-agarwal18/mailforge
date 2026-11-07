@@ -70,6 +70,7 @@ func main() {
 	messageService := message.NewService(messageRepository)
 	credentialRepository := smtpauth.NewRepository(pool)
 	metrics := observability.NewMetrics()
+	go observability.CollectPostgresPoolMetrics(ctx, pool, metrics, 5*time.Second)
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{certificate},

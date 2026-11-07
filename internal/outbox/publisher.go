@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"mailforge/internal/observability"
 )
 
 const deliveryStream = "mailforge:delivery"
@@ -15,18 +17,24 @@ type Publisher struct {
 	redis      *redis.Client
 	batchSize  int
 	lease      time.Duration
+	metrics    *observability.Metrics
 }
 
 func NewPublisher(
 	repository *Repository,
 	redisClient *redis.Client,
+	metrics ...*observability.Metrics,
 ) *Publisher {
-	return &Publisher{
+	publisher := &Publisher{
 		repository: repository,
 		redis:      redisClient,
 		batchSize:  50,
 		lease:      30 * time.Second,
 	}
+	if len(metrics) > 0 {
+		publisher.metrics = metrics[0]
+	}
+	return publisher
 }
 
 // SetBatchSize controls how many outbox events are claimed and pipelined per
@@ -43,6 +51,9 @@ func (p *Publisher) Run(ctx context.Context) {
 	defer ticker.Stop()
 
 	log.Printf("Outbox publisher started batch_size=%d", p.batchSize)
+	if p.metrics != nil {
+		go p.collectMetrics(ctx, 5*time.Second)
+	}
 
 	// Drain existing events immediately, then repeat after each poll interval.
 	p.publishAvailable(ctx)
@@ -71,17 +82,25 @@ func (p *Publisher) publishAvailable(ctx context.Context) {
 }
 
 func (p *Publisher) publishBatch(ctx context.Context) int {
+	batchStarted := time.Now()
 	events, err := p.repository.ClaimBatch(
 		ctx,
 		p.batchSize,
 		p.lease,
 	)
 	if err != nil {
+		if p.metrics != nil {
+			p.metrics.OutboxPublishErrorsTotal.WithLabelValues("claim").Inc()
+			p.metrics.OutboxPublishBatchesTotal.WithLabelValues("failure").Inc()
+		}
 		log.Printf("Failed to claim outbox events: %v", err)
 		return 0
 	}
 	if len(events) == 0 {
 		return 0
+	}
+	if p.metrics != nil {
+		p.metrics.OutboxPublishBatchSize.Observe(float64(len(events)))
 	}
 
 	// Pipeline XADD commands to reduce Redis network round trips. Commands
@@ -110,6 +129,9 @@ func (p *Publisher) publishBatch(ctx context.Context) int {
 		if command.Err() != nil {
 			failed = append(failed, events[i])
 			failureErrors = append(failureErrors, command.Err())
+			if p.metrics != nil {
+				p.metrics.OutboxPublishEventsTotal.WithLabelValues("redis_failed").Inc()
+			}
 			log.Printf(
 				"Failed to publish outbox event %s: %v",
 				events[i].ID,
@@ -118,10 +140,18 @@ func (p *Publisher) publishBatch(ctx context.Context) int {
 			continue
 		}
 		published = append(published, events[i])
+		if p.metrics != nil {
+			p.metrics.OutboxPublishEventsTotal.WithLabelValues("redis_accepted").Inc()
+		}
 	}
 
+	stateUpdateFailed := false
 	if len(failed) > 0 {
 		if markErr := p.repository.MarkFailedBatch(ctx, failed, failureErrors); markErr != nil {
+			stateUpdateFailed = true
+			if p.metrics != nil {
+				p.metrics.OutboxPublishErrorsTotal.WithLabelValues("mark_failed").Inc()
+			}
 			// Leave these leases to expire; the publisher can safely retry them.
 			log.Printf("Failed to update %d failed outbox events: %v", len(failed), markErr)
 		} else {
@@ -135,6 +165,10 @@ func (p *Publisher) publishBatch(ctx context.Context) int {
 
 	if len(published) > 0 {
 		if markErr := p.repository.MarkPublishedBatch(ctx, published); markErr != nil {
+			stateUpdateFailed = true
+			if p.metrics != nil {
+				p.metrics.OutboxPublishErrorsTotal.WithLabelValues("mark_published").Inc()
+			}
 			// Redis may already contain these events. Leave their leases to expire
 			// so they can be retried; consumers must remain idempotent.
 			log.Printf(
@@ -150,7 +184,57 @@ func (p *Publisher) publishBatch(ctx context.Context) int {
 	// A non-nil Exec error can coexist with individually successful commands.
 	// The per-command results above determine which leases are updated.
 	if pipelineErr != nil && len(failed) == 0 {
+		if p.metrics != nil {
+			p.metrics.OutboxPublishErrorsTotal.WithLabelValues("pipeline").Inc()
+		}
 		log.Printf("Redis pipeline returned an error after successful command results: %v", pipelineErr)
 	}
+
+	if p.metrics != nil {
+		outcome := "success"
+		if len(failed) > 0 || stateUpdateFailed || pipelineErr != nil {
+			outcome = "partial_failure"
+		}
+		if len(published) == 0 && len(failed) > 0 && !stateUpdateFailed {
+			outcome = "failure"
+		}
+		p.metrics.OutboxPublishBatchesTotal.WithLabelValues(outcome).Inc()
+		p.metrics.OutboxPublishDuration.Observe(time.Since(batchStarted).Seconds())
+	}
 	return len(events)
+}
+
+func (p *Publisher) collectMetrics(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	p.updateMetrics(ctx)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.updateMetrics(ctx)
+		}
+	}
+}
+
+func (p *Publisher) updateMetrics(ctx context.Context) {
+	if p.metrics == nil {
+		return
+	}
+	stats, err := p.repository.QueueStats(ctx)
+	if err != nil {
+		p.metrics.OutboxPublishErrorsTotal.WithLabelValues("stats").Inc()
+		log.Printf("Failed to collect outbox queue metrics: %v", err)
+		return
+	}
+	p.metrics.SetOutboxStats(
+		stats.Pending,
+		stats.Publishing,
+		stats.Dead,
+		time.Duration(stats.OldestPendingAgeSecs*float64(time.Second)),
+	)
 }
