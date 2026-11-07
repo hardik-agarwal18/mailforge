@@ -98,6 +98,33 @@ func run() error {
 		return err
 	}
 
+	defaultRetryPolicy := delivery.DefaultRetryPolicy()
+	retryInitialDelay, err := envDuration("DELIVERY_RETRY_INITIAL_DELAY", defaultRetryPolicy.InitialDelay)
+	if err != nil {
+		return err
+	}
+	retryMaxDelay, err := envDuration("DELIVERY_RETRY_MAX_DELAY", defaultRetryPolicy.MaxDelay)
+	if err != nil {
+		return err
+	}
+	retryMaxQueueAge, err := envDuration("DELIVERY_RETRY_MAX_QUEUE_AGE", defaultRetryPolicy.MaxQueueAge)
+	if err != nil {
+		return err
+	}
+	retryMaxAttempts, err := envInt("DELIVERY_RETRY_MAX_ATTEMPTS", defaultRetryPolicy.MaxAttempts)
+	if err != nil {
+		return err
+	}
+	retryPolicy := delivery.RetryPolicy{
+		InitialDelay: retryInitialDelay,
+		MaxDelay:     retryMaxDelay,
+		MaxQueueAge:  retryMaxQueueAge,
+		MaxAttempts:  retryMaxAttempts,
+	}
+	if err := retryPolicy.Validate(); err != nil {
+		return fmt.Errorf("invalid delivery retry policy: %w", err)
+	}
+
 	// --------------------------------------------------
 	// PostgreSQL
 	// --------------------------------------------------
@@ -187,7 +214,10 @@ func run() error {
 	// Delivery repository
 	// --------------------------------------------------
 
-	repository := delivery.NewRepository(db)
+	repository, err := delivery.NewRepositoryWithRetryPolicy(db, retryPolicy)
+	if err != nil {
+		return fmt.Errorf("configure delivery repository: %w", err)
+	}
 
 	// --------------------------------------------------
 	// Redis consumer
@@ -304,11 +334,15 @@ func run() error {
 	)
 
 	log.Printf(
-		"Starting MailForge delivery worker: concurrency=%d smtp_connect_timeout=%s smtp_operation_timeout=%s smtp_delivery_timeout=%s",
+		"Starting MailForge delivery worker: concurrency=%d smtp_connect_timeout=%s smtp_operation_timeout=%s smtp_delivery_timeout=%s retry_initial=%s retry_max=%s retry_max_queue_age=%s retry_max_attempts=%d",
 		workerConcurrency,
 		connectTimeout,
 		operationTimeout,
 		deliveryTimeout,
+		retryPolicy.InitialDelay,
+		retryPolicy.MaxDelay,
+		retryPolicy.MaxQueueAge,
+		retryPolicy.MaxAttempts,
 	)
 
 	// --------------------------------------------------

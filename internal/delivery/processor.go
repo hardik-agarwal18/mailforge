@@ -123,22 +123,30 @@ func (p *Processor) Process(
 	}
 
 	log.Printf(
-		"Delivery failed: recipient=%s smtp_code=%d permanent=%t error=%v",
+		"Delivery failed: recipient=%s smtp_stage=%s smtp_code=%d enhanced_status=%s permanent=%t error=%v",
 		job.RecipientID,
+		deliveryErr.Stage,
 		deliveryErr.SMTPCode,
+		deliveryErr.EnhancedStatusCode,
 		deliveryErr.Permanent,
 		deliveryErr,
 	)
+
+	details := SMTPFailureDetails{
+		EnhancedStatusCode: deliveryErr.EnhancedStatusCode,
+		Stage:              deliveryErr.Stage,
+	}
 
 	if deliveryErr.Permanent {
 		if p.metrics != nil {
 			p.metrics.RecordDeliveryAttempt(duration, "permanent_failure")
 		}
-		return p.repository.RecordPermanentFailure(
+		return p.repository.RecordPermanentFailureWithDetails(
 			ctx,
 			job,
 			deliveryErr.SMTPCode,
 			deliveryErr.Message,
+			details,
 		)
 	}
 
@@ -146,11 +154,12 @@ func (p *Processor) Process(
 		p.metrics.RecordDeliveryAttempt(duration, "temporary_failure")
 	}
 
-	return p.repository.RecordTemporaryFailure(
+	return p.repository.RecordTemporaryFailureWithDetails(
 		ctx,
 		job,
 		deliveryErr.SMTPCode,
 		deliveryErr.Message,
+		details,
 	)
 }
 

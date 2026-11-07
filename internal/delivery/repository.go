@@ -11,10 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const (
-	maxDeliveryAttempts = 10
-	deliveryLease       = 90 * time.Second
-)
+const deliveryLease = 90 * time.Second
 
 var (
 	// ErrRecipientBusy means another worker owns a non-expired PostgreSQL
@@ -34,11 +31,26 @@ var (
 )
 
 type Repository struct {
-	db *pgxpool.Pool
+	db          *pgxpool.Pool
+	retryPolicy RetryPolicy
+}
+
+// SMTPFailureDetails are retained for diagnostics and DSN generation.
+// Fields are empty for failures that did not contain an SMTP reply.
+type SMTPFailureDetails struct {
+	EnhancedStatusCode string
+	Stage              string
 }
 
 func NewRepository(db *pgxpool.Pool) *Repository {
-	return &Repository{db: db}
+	return &Repository{db: db, retryPolicy: DefaultRetryPolicy()}
+}
+
+func NewRepositoryWithRetryPolicy(db *pgxpool.Pool, policy RetryPolicy) (*Repository, error) {
+	if err := policy.Validate(); err != nil {
+		return nil, err
+	}
+	return &Repository{db: db, retryPolicy: policy}, nil
 }
 
 // ClaimRecipient atomically claims an eligible recipient. PostgreSQL is the
@@ -237,7 +249,7 @@ func (r *Repository) RecordSuccess(
 	ctx context.Context,
 	job *ClaimedDelivery,
 ) error {
-	return r.recordOutcome(ctx, job, "success", "delivered", 0, "")
+	return r.recordOutcome(ctx, job, "success", "delivered", 0, "", SMTPFailureDetails{})
 }
 
 func (r *Repository) RecordPermanentFailure(
@@ -246,6 +258,16 @@ func (r *Repository) RecordPermanentFailure(
 	smtpCode int,
 	response string,
 ) error {
+	return r.RecordPermanentFailureWithDetails(ctx, job, smtpCode, response, SMTPFailureDetails{})
+}
+
+func (r *Repository) RecordPermanentFailureWithDetails(
+	ctx context.Context,
+	job *ClaimedDelivery,
+	smtpCode int,
+	response string,
+	details SMTPFailureDetails,
+) error {
 	return r.recordOutcome(
 		ctx,
 		job,
@@ -253,6 +275,7 @@ func (r *Repository) RecordPermanentFailure(
 		"bounced",
 		smtpCode,
 		response,
+		details,
 	)
 }
 
@@ -262,18 +285,20 @@ func (r *Repository) RecordTemporaryFailure(
 	smtpCode int,
 	response string,
 ) error {
-	if job.Attempts >= maxDeliveryAttempts {
-		return r.recordOutcome(
-			ctx,
-			job,
-			"temporary_failure",
-			"bounced",
-			smtpCode,
-			response+" (maximum delivery attempts reached)",
-		)
-	}
+	return r.RecordTemporaryFailureWithDetails(ctx, job, smtpCode, response, SMTPFailureDetails{})
+}
 
-	retryAfter := retryDelay(job.Attempts)
+func (r *Repository) RecordTemporaryFailureWithDetails(
+	ctx context.Context,
+	job *ClaimedDelivery,
+	smtpCode int,
+	response string,
+	details SMTPFailureDetails,
+) error {
+	if job == nil {
+		return fmt.Errorf("claimed delivery is required")
+	}
+	retryAfter := r.retryPolicy.DelayForAttempt(job.Attempts)
 	return r.recordOutcome(
 		ctx,
 		job,
@@ -281,24 +306,9 @@ func (r *Repository) RecordTemporaryFailure(
 		"deferred",
 		smtpCode,
 		response,
+		details,
 		retryAfter,
 	)
-}
-
-// retryDelay uses exponential backoff capped at one hour.
-func retryDelay(attempt int) time.Duration {
-	if attempt < 1 {
-		attempt = 1
-	}
-
-	delay := 30 * time.Second
-	for i := 1; i < attempt; i++ {
-		if delay >= time.Hour/2 {
-			return time.Hour
-		}
-		delay *= 2
-	}
-	return delay
 }
 
 // recordOutcome atomically changes recipient state, records the attempt,
@@ -310,6 +320,7 @@ func (r *Repository) recordOutcome(
 	recipientStatus string,
 	smtpCode int,
 	response string,
+	details SMTPFailureDetails,
 	retryDelays ...time.Duration,
 ) error {
 	if job == nil {
@@ -329,6 +340,32 @@ func (r *Repository) recordOutcome(
 		return fmt.Errorf("begin delivery outcome transaction: %w", err)
 	}
 	defer tx.Rollback(context.Background())
+
+	// A temporary SMTP response remains deferred until the configured queue
+	// lifetime or safety attempt limit is reached. This is local expiry policy,
+	// not a reinterpretation of the remote SMTP response as a permanent error.
+	if recipientStatus == "deferred" {
+		var queuedAgeSeconds float64
+		if err := tx.QueryRow(ctx, `
+			SELECT GREATEST(EXTRACT(EPOCH FROM (NOW() - created_at)), 0)::double precision
+			FROM recipients
+			WHERE id = $1::uuid
+		`, job.RecipientID).Scan(&queuedAgeSeconds); err != nil {
+			return fmt.Errorf("check delivery queue age: %w", err)
+		}
+
+		switch {
+		case job.Attempts >= r.retryPolicy.MaxAttempts:
+			recipientStatus = "bounced"
+			response += " (local maximum retry attempts reached)"
+		case time.Duration(queuedAgeSeconds*float64(time.Second)) >= r.retryPolicy.MaxQueueAge:
+			recipientStatus = "bounced"
+			response += " (local maximum queue lifetime reached)"
+		}
+		if recipientStatus != "deferred" {
+			retryAfter = 0
+		}
+	}
 
 	// The expiry predicate prevents an old worker from committing after its
 	// lease has expired, even if another worker has not claimed it yet.
@@ -367,15 +404,19 @@ func (r *Repository) recordOutcome(
 			attempt_number,
 			status,
 			smtp_code,
+			enhanced_status_code,
+			smtp_stage,
 			response,
 			attempted_at
 		)
-		VALUES ($1::uuid, $2, $3, $4, $5, NOW())
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, NOW())
 	`,
 		job.RecipientID,
 		job.Attempts,
 		attemptStatus,
 		nullableSMTPCode(smtpCode),
+		nullableString(details.EnhancedStatusCode),
+		nullableString(details.Stage),
 		response,
 	)
 	if err != nil {
@@ -440,6 +481,13 @@ func nullableSMTPCode(code int) any {
 	return code
 }
 
+func nullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
 // Compatibility methods retained for callers outside Processor.
 func (r *Repository) MarkDelivered(
 	ctx context.Context,
@@ -463,6 +511,7 @@ func (r *Repository) MarkDeferred(
 		"deferred",
 		0,
 		"",
+		SMTPFailureDetails{},
 		retryAfter,
 	)
 }

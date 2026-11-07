@@ -159,17 +159,17 @@ func (c *Client) sendToHost(
 
 	client := session.client
 	if err := c.setOperationDeadline(ctx, session.conn); err != nil {
-		return classifyError(err)
+		return classifyErrorAtStage("mail_from", err)
 	}
 	if err := client.Mail(sender); err != nil {
-		return classifyError(fmt.Errorf("MAIL FROM: %w", err))
+		return classifyErrorAtStage("mail_from", fmt.Errorf("MAIL FROM: %w", err))
 	}
 
 	if err := c.setOperationDeadline(ctx, session.conn); err != nil {
-		return classifyError(err)
+		return classifyErrorAtStage("rcpt_to", err)
 	}
 	if err := client.Rcpt(recipient); err != nil {
-		return classifyError(fmt.Errorf("RCPT TO: %w", err))
+		return classifyErrorAtStage("rcpt_to", fmt.Errorf("RCPT TO: %w", err))
 	}
 
 	if err := c.setOperationDeadline(ctx, session.conn); err != nil {
@@ -177,24 +177,24 @@ func (c *Client) sendToHost(
 	}
 	writer, err := client.Data()
 	if err != nil {
-		return classifyError(fmt.Errorf("DATA: %w", err))
+		return classifyErrorAtStage("data", fmt.Errorf("DATA: %w", err))
 	}
 
 	if err := c.setOperationDeadline(ctx, session.conn); err != nil {
-		_ = writer.Close()
-		return classifyError(err)
+		// Do not close the DATA writer here: Close sends the terminating dot
+		// and could cause the remote server to accept a partial/empty message.
+		// The deferred session close aborts the incomplete SMTP transaction.
+		return classifyErrorAtStage("data_write", err)
 	}
 	if _, err := io.Copy(writer, bytes.NewReader(rawMessage)); err != nil {
-		_ = writer.Close()
-		return classifyError(fmt.Errorf("write message: %w", err))
+		return classifyErrorAtStage("data_write", fmt.Errorf("write message: %w", err))
 	}
 
 	if err := c.setOperationDeadline(ctx, session.conn); err != nil {
-		_ = writer.Close()
-		return classifyError(err)
+		return classifyErrorAtStage("data_final", err)
 	}
 	if err := writer.Close(); err != nil {
-		return classifyError(fmt.Errorf("finish DATA: %w", err))
+		return classifyErrorAtStage("data_final", fmt.Errorf("finish DATA: %w", err))
 	}
 	return nil
 }
@@ -209,7 +209,7 @@ func (c *Client) connectToHost(
 ) (*smtpSession, error) {
 	conn, err := c.dialer.DialContext(ctx, "tcp", dialAddress)
 	if err != nil {
-		return nil, classifyError(fmt.Errorf("connect to %s: %w", dialAddress, err))
+		return nil, classifyErrorAtStage("connect", fmt.Errorf("connect to %s: %w", dialAddress, err))
 	}
 
 	// A cancelled parent context must interrupt a blocked greeting, EHLO or
@@ -219,24 +219,24 @@ func (c *Client) connectToHost(
 	if err := c.setOperationDeadline(ctx, conn); err != nil {
 		stopClose()
 		_ = conn.Close()
-		return nil, classifyError(err)
+		return nil, classifyErrorAtStage("greeting", err)
 	}
 	client, err := smtp.NewClient(conn, tlsServerName)
 	if err != nil {
 		stopClose()
 		_ = conn.Close()
-		return nil, classifyError(fmt.Errorf("SMTP greeting from %s: %w", tlsServerName, err))
+		return nil, classifyErrorAtStage("greeting", fmt.Errorf("SMTP greeting from %s: %w", tlsServerName, err))
 	}
 
 	if err := c.setOperationDeadline(ctx, conn); err != nil {
 		stopClose()
 		_ = conn.Close()
-		return nil, classifyError(err)
+		return nil, classifyErrorAtStage("ehlo", err)
 	}
 	if err := client.Hello(c.config.EHLOName); err != nil {
 		stopClose()
 		_ = conn.Close()
-		return nil, classifyError(fmt.Errorf("EHLO %s at %s: %w", c.config.EHLOName, tlsServerName, err))
+		return nil, classifyErrorAtStage("ehlo", fmt.Errorf("EHLO %s at %s: %w", c.config.EHLOName, tlsServerName, err))
 	}
 
 	hasSTARTTLS, _ := client.Extension("STARTTLS")
@@ -246,6 +246,7 @@ func (c *Client) connectToHost(
 		return nil, &DeliveryError{
 			Message:   fmt.Sprintf("MX host %s does not support required STARTTLS", tlsServerName),
 			Permanent: false,
+			Stage:     "starttls_policy",
 		}
 	}
 
@@ -257,12 +258,12 @@ func (c *Client) connectToHost(
 		if err := c.setOperationDeadline(ctx, conn); err != nil {
 			stopClose()
 			_ = conn.Close()
-			return nil, classifyError(err)
+			return nil, classifyErrorAtStage("starttls", err)
 		}
 		if err := client.StartTLS(tlsConfig); err != nil {
 			stopClose()
 			_ = conn.Close()
-			return nil, classifyError(fmt.Errorf("STARTTLS with %s: %w", tlsServerName, err))
+			return nil, classifyErrorAtStage("starttls", fmt.Errorf("STARTTLS with %s: %w", tlsServerName, err))
 		}
 	}
 
