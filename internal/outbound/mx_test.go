@@ -1,6 +1,7 @@
 package outbound
 
 import (
+	"context"
 	"net"
 	"testing"
 )
@@ -32,5 +33,13 @@ func TestIsPublicIP(t *testing.T) {
 				t.Fatalf("isPublicIP(%s) = %v, want %v", test.ip, got, test.want)
 			}
 		})
+	}
+}
+
+func TestMXResolverRejectsMalformedRecipientBeforeDNS(t *testing.T) {
+	resolver := NewMXResolver()
+	_, err := resolver.Lookup(context.Background(), "recipient@@example.com")
+	if err == nil {
+		t.Fatal("Lookup() accepted malformed recipient address")
 	}
 }

@@ -7,7 +7,8 @@ import (
 	"net"
 	"net/netip"
 	"sort"
-	"strings"
+
+	"mailforge/internal/emailaddr"
 )
 
 var ErrNoPublicMXAddress = errors.New("MX host has no publicly routable IP address")
@@ -24,12 +25,11 @@ func NewMXResolver() *MXResolver {
 }
 
 func (r *MXResolver) Lookup(ctx context.Context, email string) ([]*net.MX, error) {
-	parts := strings.Split(email, "@")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return nil, fmt.Errorf("invalid recipient address")
+	mailbox, err := emailaddr.ParseMailbox(email)
+	if err != nil {
+		return nil, fmt.Errorf("invalid recipient address: %w", err)
 	}
-
-	domain := strings.TrimSuffix(parts[1], ".")
+	domain := mailbox.Domain
 	records, err := r.resolver.LookupMX(ctx, domain)
 	if err != nil {
 		// RFC 5321 implicit MX fallback: when no MX record exists, try the

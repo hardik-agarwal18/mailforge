@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -58,4 +59,30 @@ func TestSendTimesOutWhenRelayNeverSendsGreeting(t *testing.T) {
 
 	_ = listener.Close()
 	<-serverDone
+}
+
+func TestSendRejectsInvalidEnvelopeBeforeNetworkAccess(t *testing.T) {
+	client := NewClient()
+	tests := []struct {
+		name      string
+		sender    string
+		recipient string
+	}{
+		{name: "invalid sender", sender: "sender@@example.com", recipient: "recipient@example.net"},
+		{name: "invalid recipient", sender: "sender@example.com", recipient: "recipient@"},
+		{name: "null recipient", sender: "sender@example.com", recipient: ""},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := client.Send(context.Background(), test.sender, test.recipient, nil)
+			if err == nil {
+				t.Fatal("Send() succeeded for invalid envelope")
+			}
+			var deliveryErr *DeliveryError
+			if !errors.As(err, &deliveryErr) || !deliveryErr.Permanent {
+				t.Fatalf("Send() error = %v, want permanent DeliveryError", err)
+			}
+		})
+	}
 }

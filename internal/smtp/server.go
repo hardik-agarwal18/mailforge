@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mailforge/internal/message"
 	"net"
 	"strings"
 	"sync"
 	"time"
+
+	"mailforge/internal/emailaddr"
+	"mailforge/internal/message"
 )
 
 const (
@@ -349,8 +351,8 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 				continue
 			}
 
-			if identity.Username == "" || identity.Email == "" {
-				log.Printf("SMTP authenticator returned an incomplete identity")
+			if identity.Username == "" || emailaddr.ValidateMailbox(identity.Email) != nil {
+				log.Printf("SMTP authenticator returned an incomplete or invalid identity")
 				_ = writeReply(conn, "454 4.7.0 Temporary authentication failure")
 				continue
 			}
@@ -381,10 +383,10 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 
 			address, ok := parsePath(cmd.Arg, "FROM:")
 			if !ok {
-				_ = writeReply(conn, "501 5.1.7 Invalid sender")
+				_ = writeReply(conn, "553 5.1.7 Invalid sender address")
 				continue
 			}
-			if s.submission && !strings.EqualFold(address, session.AuthenticatedEmail) {
+			if s.submission && (address == "" || !emailaddr.Equal(address, session.AuthenticatedEmail)) {
 				_ = writeReply(conn, "553 5.7.1 Sender address is not authorized for this account")
 				continue
 			}
@@ -402,7 +404,7 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 
 			address, ok := parsePath(cmd.Arg, "TO:")
 			if !ok {
-				_ = writeReply(conn, "501 5.1.3 Invalid recipient")
+				_ = writeReply(conn, "553 5.1.3 Invalid recipient address")
 				continue
 			}
 
@@ -471,9 +473,14 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 			if err != nil {
 				log.Printf("Message persistence failed: %v", err)
 				session.ResetTransaction()
-				if errors.Is(err, message.ErrSubmissionQuotaExceeded) {
+				switch {
+				case errors.Is(err, message.ErrSubmissionQuotaExceeded):
 					_ = writeReply(conn, "452 4.7.0 Submission rate limit exceeded; try again later")
-				} else {
+				case errors.Is(err, message.ErrInvalidSender):
+					_ = writeReply(conn, "554 5.6.0 Invalid sender envelope")
+				case errors.Is(err, message.ErrInvalidRecipient):
+					_ = writeReply(conn, "554 5.6.0 Invalid recipient envelope")
+				default:
 					_ = writeReply(conn, "451 4.3.0 Temporary message storage failure")
 				}
 				continue
@@ -667,9 +674,16 @@ func parsePath(arg, prefix string) (string, bool) {
 	}
 	address := path[1 : len(path)-1]
 	if address == "" {
-		return "", prefix == "FROM:"
+		return "", strings.EqualFold(prefix, "FROM:")
 	}
-	if strings.ContainsAny(address, " \t\r\n<>") || !strings.Contains(address, "@") {
+	if strings.ContainsAny(address, "\x00\r\n<>") {
+		return "", false
+	}
+	if strings.EqualFold(prefix, "FROM:") {
+		if emailaddr.ValidateReversePath(address) != nil {
+			return "", false
+		}
+	} else if emailaddr.ValidateMailbox(address) != nil {
 		return "", false
 	}
 	return address, true

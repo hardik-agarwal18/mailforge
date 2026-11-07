@@ -11,6 +11,8 @@ import (
 	"net/smtp"
 	"strings"
 	"time"
+
+	"mailforge/internal/emailaddr"
 )
 
 func (c *Client) Send(
@@ -19,6 +21,13 @@ func (c *Client) Send(
 	recipient string,
 	rawMessage []byte,
 ) error {
+	if err := emailaddr.ValidateReversePath(sender); err != nil {
+		return &DeliveryError{Message: fmt.Sprintf("invalid envelope sender: %v", err), Permanent: true}
+	}
+	if err := emailaddr.ValidateMailbox(recipient); err != nil {
+		return &DeliveryError{Message: fmt.Sprintf("invalid envelope recipient: %v", err), Permanent: true}
+	}
+
 	deliveryCtx, cancel := context.WithTimeout(ctx, c.config.DeliveryTimeout)
 	defer cancel()
 

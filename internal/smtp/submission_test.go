@@ -201,11 +201,31 @@ func TestSubmissionRequiresTLSAndAuthenticationAndBindsSender(t *testing.T) {
 	writeCommand(t, tlsClient, "AUTH PLAIN "+plainAuth)
 	assertCode(t, readReply(t, reader), "235")
 
+	writeCommand(t, tlsClient, "MAIL FROM:<sender@@example.com>")
+	assertCode(t, readReply(t, reader), "553")
+
 	writeCommand(t, tlsClient, "MAIL FROM:<attacker@example.com>")
+	assertCode(t, readReply(t, reader), "553")
+
+	// Domain names are case-insensitive, but SMTP local-parts are not.
+	writeCommand(t, tlsClient, "MAIL FROM:<sender@EXAMPLE.COM>")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, tlsClient, "RSET")
+	assertCode(t, readReply(t, reader), "250")
+
+	writeCommand(t, tlsClient, "MAIL FROM:<Sender@example.com>")
+	assertCode(t, readReply(t, reader), "553")
+
+	writeCommand(t, tlsClient, "MAIL FROM:<>")
 	assertCode(t, readReply(t, reader), "553")
 
 	writeCommand(t, tlsClient, "MAIL FROM:<sender@example.com>")
 	assertCode(t, readReply(t, reader), "250")
+
+	writeCommand(t, tlsClient, "RCPT TO:<recipient@@example.net>")
+	assertCode(t, readReply(t, reader), "553")
+	writeCommand(t, tlsClient, "RCPT TO:<recipient@>")
+	assertCode(t, readReply(t, reader), "553")
 
 	writeCommand(t, tlsClient, "RCPT TO:<recipient@example.net>")
 	assertCode(t, readReply(t, reader), "250")
