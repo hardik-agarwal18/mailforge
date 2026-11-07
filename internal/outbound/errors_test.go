@@ -156,3 +156,27 @@ func TestSMTPReplySeverityUsesFirstDigitForUnknownCodes(t *testing.T) {
 		}
 	}
 }
+
+func TestFinalDATANetworkFailureIsAmbiguousButPreTerminatorFailureIsRetryable(t *testing.T) {
+	for _, test := range []struct {
+		stage         string
+		wantAmbiguous bool
+		wantPermanent bool
+	}{
+		{stage: "data_final", wantAmbiguous: true},
+		{stage: "data_write", wantAmbiguous: false},
+		{stage: "connect", wantAmbiguous: false},
+	} {
+		got := classifyErrorAtStage(test.stage, errors.New("connection reset"))
+		var deliveryErr *DeliveryError
+		if !errors.As(got, &deliveryErr) {
+			t.Fatalf("stage %s: expected DeliveryError, got %T", test.stage, got)
+		}
+		if deliveryErr.Ambiguous != test.wantAmbiguous {
+			t.Errorf("stage %s: Ambiguous=%t, want %t", test.stage, deliveryErr.Ambiguous, test.wantAmbiguous)
+		}
+		if deliveryErr.Permanent != test.wantPermanent {
+			t.Errorf("stage %s: Permanent=%t, want %t", test.stage, deliveryErr.Permanent, test.wantPermanent)
+		}
+	}
+}

@@ -18,6 +18,10 @@ type DeliveryError struct {
 	SMTPCode           int
 	EnhancedStatusCode string
 	Stage              string
+	// Ambiguous means the remote server may have accepted the message but
+	// MailForge did not receive a definitive final response. Automatic retry
+	// risks duplicate delivery and should be suppressed pending reconciliation.
+	Ambiguous bool
 }
 
 func (e *DeliveryError) Error() string {
@@ -60,8 +64,19 @@ func classifyErrorAtStage(stage string, err error) error {
 		}
 	}
 
-	// Network, temporary DNS, TLS, and unexpected protocol failures are
-	// retryable. SMTP servers can recover without changing the message.
+	// If the DATA terminator may already have reached the remote server but
+	// its final reply was lost, acceptance is unknowable. Do not retry blindly.
+	if stage == "data_final" {
+		return &DeliveryError{
+			Message:   err.Error(),
+			Stage:     stage,
+			Permanent: false,
+			Ambiguous: true,
+		}
+	}
+
+	// Network, temporary DNS, TLS, and unexpected protocol failures before
+	// final DATA acceptance are retryable.
 	return &DeliveryError{
 		Message:   err.Error(),
 		Stage:     stage,

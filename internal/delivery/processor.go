@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	leaseHeartbeatInterval = 20 * time.Second
-	leaseRenewTimeout      = 5 * time.Second
+	leaseHeartbeatInterval    = 20 * time.Second
+	leaseRenewTimeout         = 5 * time.Second
+	outcomePersistenceTimeout = 10 * time.Second
 )
 
 type Processor struct {
@@ -48,8 +49,8 @@ func (p *Processor) Process(
 		return fmt.Errorf("claim recipient: %w", err)
 	}
 
-	// A nil job is returned only for a terminal recipient state (delivered or
-	// bounced). It is safe for Worker to acknowledge this duplicate event.
+	// A nil job is returned only for a terminal recipient state (delivered,
+	// bounced, or unknown pending manual reconciliation). It is safe for Worker to acknowledge this duplicate event.
 	if job == nil {
 		log.Printf(
 			"Recipient is already in a terminal state: recipient=%s event=%s",
@@ -83,12 +84,23 @@ func (p *Processor) Process(
 	)
 
 	startedAt := time.Now()
-	sendErr := p.sender.Send(
-		deliveryCtx,
-		job.Sender,
-		job.Email,
-		job.RawMessage,
-	)
+	var transportInfo outbound.DeliveryInfo
+	var sendErr error
+	if detailedSender, ok := p.sender.(DetailedSender); ok {
+		transportInfo, sendErr = detailedSender.SendWithResult(
+			deliveryCtx,
+			job.Sender,
+			job.Email,
+			job.RawMessage,
+		)
+	} else {
+		sendErr = p.sender.Send(
+			deliveryCtx,
+			job.Sender,
+			job.Email,
+			job.RawMessage,
+		)
+	}
 	duration := time.Since(startedAt)
 
 	// Stop the heartbeat and wait for any in-flight renewal to finish before
@@ -104,15 +116,24 @@ func (p *Processor) Process(
 	default:
 	}
 
-	if ctx.Err() != nil {
-		return fmt.Errorf("delivery interrupted: %w", ctx.Err())
-	}
+	// Once the SMTP call has returned, its outcome must be committed even
+	// during graceful shutdown. Otherwise a successful remote acceptance can
+	// be forgotten and replayed after the PostgreSQL lease expires. Preserve
+	// context values but detach cancellation for this bounded state transition.
+	outcomeCtx, outcomeCancel := context.WithTimeout(context.WithoutCancel(ctx), outcomePersistenceTimeout)
+	defer outcomeCancel()
 
 	if sendErr == nil {
 		if p.metrics != nil {
 			p.metrics.RecordDeliveryAttempt(duration, "success")
 		}
-		return p.repository.RecordSuccess(ctx, job)
+		return p.repository.RecordSuccessWithDetails(outcomeCtx, job, SMTPFailureDetails{
+			RemoteHost:     transportInfo.RemoteHost,
+			TLSUsed:        transportInfo.TLSUsed,
+			TLSMode:        transportInfo.TLSMode,
+			TLSVersion:     transportInfo.TLSVersion,
+			TLSCipherSuite: transportInfo.TLSCipherSuite,
+		})
 	}
 
 	var deliveryErr *outbound.DeliveryError
@@ -135,6 +156,18 @@ func (p *Processor) Process(
 	details := SMTPFailureDetails{
 		EnhancedStatusCode: deliveryErr.EnhancedStatusCode,
 		Stage:              deliveryErr.Stage,
+		RemoteHost:         transportInfo.RemoteHost,
+		TLSUsed:            transportInfo.TLSUsed,
+		TLSMode:            transportInfo.TLSMode,
+		TLSVersion:         transportInfo.TLSVersion,
+		TLSCipherSuite:     transportInfo.TLSCipherSuite,
+	}
+
+	if deliveryErr.Ambiguous {
+		if p.metrics != nil {
+			p.metrics.RecordDeliveryAttempt(duration, "unknown")
+		}
+		return p.repository.RecordUnknownOutcome(outcomeCtx, job, deliveryErr.Message, details)
 	}
 
 	if deliveryErr.Permanent {
@@ -142,7 +175,7 @@ func (p *Processor) Process(
 			p.metrics.RecordDeliveryAttempt(duration, "permanent_failure")
 		}
 		return p.repository.RecordPermanentFailureWithDetails(
-			ctx,
+			outcomeCtx,
 			job,
 			deliveryErr.SMTPCode,
 			deliveryErr.Message,
@@ -155,7 +188,7 @@ func (p *Processor) Process(
 	}
 
 	return p.repository.RecordTemporaryFailureWithDetails(
-		ctx,
+		outcomeCtx,
 		job,
 		deliveryErr.SMTPCode,
 		deliveryErr.Message,

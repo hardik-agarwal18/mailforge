@@ -283,6 +283,29 @@ func run() error {
 		smtpConfig.RelayHost = relayHost
 		smtpConfig.RelayPort = relayPort
 
+		relayTLSMode := strings.ToLower(strings.TrimSpace(os.Getenv("SMTP_RELAY_TLS_MODE")))
+		if relayTLSMode == "" {
+			switch relayPort {
+			case 465:
+				relayTLSMode = string(outbound.TLSModeImplicit)
+			case 587:
+				relayTLSMode = string(outbound.TLSModeRequiredSTARTTLS)
+			case 25:
+				if smtpConfig.RequireSTARTTLS {
+					relayTLSMode = string(outbound.TLSModeRequiredSTARTTLS)
+				} else {
+					relayTLSMode = string(outbound.TLSModeStartTLS)
+				}
+			default:
+				if smtpConfig.RequireSTARTTLS {
+					relayTLSMode = string(outbound.TLSModeRequiredSTARTTLS)
+				} else {
+					relayTLSMode = string(outbound.TLSModeNone)
+				}
+			}
+		}
+		smtpConfig.RelayTLSMode = outbound.TLSMode(relayTLSMode)
+
 		smtpClient, err = outbound.NewRelayClient(smtpConfig)
 		if err != nil {
 			return fmt.Errorf(
@@ -292,12 +315,15 @@ func run() error {
 		}
 
 		log.Printf(
-			"Using SMTP relay %s:%d (EHLO=%s, require_starttls=%t)",
+			"Using SMTP relay %s:%d (EHLO=%s, tls_mode=%s)",
 			relayHost,
 			relayPort,
 			smtpConfig.EHLOName,
-			smtpConfig.RequireSTARTTLS,
+			smtpConfig.RelayTLSMode,
 		)
+		if smtpConfig.RelayTLSMode == outbound.TLSModeNone {
+			log.Printf("WARNING: SMTP relay transport TLS is disabled for %s:%d", relayHost, relayPort)
+		}
 	} else {
 		smtpClient, err = outbound.NewClientWithConfig(
 			smtpConfig,
@@ -309,7 +335,11 @@ func run() error {
 			)
 		}
 
-		log.Printf("Using direct MX delivery (EHLO=%s, require_starttls=%t)", smtpConfig.EHLOName, smtpConfig.RequireSTARTTLS)
+		directTLSMode := outbound.TLSModeStartTLS
+		if smtpConfig.RequireSTARTTLS {
+			directTLSMode = outbound.TLSModeRequiredSTARTTLS
+		}
+		log.Printf("Using direct MX delivery (EHLO=%s, tls_mode=%s)", smtpConfig.EHLOName, directTLSMode)
 	}
 
 	// --------------------------------------------------

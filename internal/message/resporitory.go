@@ -147,6 +147,18 @@ func (r *Repository) Create(
 			)
 		}
 
+		// Record the initial durable delivery state in the same transaction
+		// as the recipient and its outbox event.
+		_, err = tx.Exec(ctx, `
+			INSERT INTO delivery_status_events (
+				recipient_id, from_status, to_status, event_type, diagnostic
+			)
+			VALUES ($1::uuid, NULL, 'pending', 'submitted', 'Recipient accepted for delivery')
+		`, recipientID)
+		if err != nil {
+			return "", fmt.Errorf("record initial recipient delivery status: %w", err)
+		}
+
 		// 3. Construct delivery event.
 		event := DeliveryEvent{
 			RecipientID: recipientID,

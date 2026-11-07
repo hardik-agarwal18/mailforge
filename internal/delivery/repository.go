@@ -27,6 +27,7 @@ var (
 	ErrRecipientNotReady = errors.New("recipient is not ready for delivery")
 
 	ErrRecipientNotFound    = errors.New("recipient does not exist")
+	ErrMessageNotFound      = errors.New("message does not exist")
 	ErrRecipientDataMissing = errors.New("recipient message data is missing")
 )
 
@@ -40,6 +41,11 @@ type Repository struct {
 type SMTPFailureDetails struct {
 	EnhancedStatusCode string
 	Stage              string
+	RemoteHost         string
+	TLSUsed            bool
+	TLSMode            string
+	TLSVersion         string
+	TLSCipherSuite     string
 }
 
 func NewRepository(db *pgxpool.Pool) *Repository {
@@ -67,6 +73,7 @@ func (r *Repository) ClaimRecipient(
 	defer tx.Rollback(context.Background())
 
 	var job ClaimedDelivery
+	var previousStatus string
 
 	err = tx.QueryRow(ctx, `
 		SELECT
@@ -75,7 +82,8 @@ func (r *Repository) ClaimRecipient(
 			r.email,
 			r.attempts,
 			m.envelope_sender,
-			m.raw_message
+			m.raw_message,
+			r.status
 		FROM recipients r
 		JOIN messages m ON m.id = r.message_id
 		WHERE r.id = $1::uuid
@@ -103,6 +111,7 @@ func (r *Repository) ClaimRecipient(
 		&job.Attempts,
 		&job.Sender,
 		&job.RawMessage,
+		&previousStatus,
 	)
 
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -152,8 +161,9 @@ func (r *Repository) ClaimRecipient(
 		}
 
 		switch status {
-		case "delivered", "bounced":
-			// Terminal recipient state; this duplicate event is safe to ACK.
+		case "delivered", "bounced", "unknown":
+			// Terminal automatic-delivery states. An unknown result requires
+			// operator reconciliation before it can safely be retried.
 			return nil, nil
 
 		case "delivering":
@@ -192,7 +202,9 @@ func (r *Repository) ClaimRecipient(
 		UPDATE recipients
 		SET
 			status = 'delivering',
+			next_attempt_at = NULL,
 			attempts = attempts + 1,
+			last_attempt_at = NOW(),
 			delivery_lease_until = NOW() + make_interval(secs => $2::double precision),
 			delivery_lease_token = gen_random_uuid(),
 			updated_at = NOW()
@@ -207,6 +219,20 @@ func (r *Repository) ClaimRecipient(
 	)
 	if err != nil {
 		return nil, fmt.Errorf("assign delivery lease: %w", err)
+	}
+
+	claimEventType := "attempt_started"
+	if previousStatus == "delivering" {
+		claimEventType = "lease_reclaimed"
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO delivery_status_events (
+			recipient_id, from_status, to_status, event_type, diagnostic
+		)
+		VALUES ($1::uuid, $2, 'delivering', $3, 'Worker claimed recipient for SMTP delivery')
+	`, job.RecipientID, previousStatus, claimEventType)
+	if err != nil {
+		return nil, fmt.Errorf("record delivery claim status event: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -249,7 +275,26 @@ func (r *Repository) RecordSuccess(
 	ctx context.Context,
 	job *ClaimedDelivery,
 ) error {
-	return r.recordOutcome(ctx, job, "success", "delivered", 0, "", SMTPFailureDetails{})
+	return r.RecordSuccessWithDetails(ctx, job, SMTPFailureDetails{})
+}
+
+func (r *Repository) RecordSuccessWithDetails(
+	ctx context.Context,
+	job *ClaimedDelivery,
+	details SMTPFailureDetails,
+) error {
+	return r.recordOutcome(ctx, job, "success", "delivered", 250, "remote SMTP server accepted message", details)
+}
+
+// RecordUnknownOutcome records a final DATA ambiguity without automatically
+// retrying. The remote server may already have accepted the message.
+func (r *Repository) RecordUnknownOutcome(
+	ctx context.Context,
+	job *ClaimedDelivery,
+	response string,
+	details SMTPFailureDetails,
+) error {
+	return r.recordOutcome(ctx, job, "unknown", "unknown", 0, response, details)
 }
 
 func (r *Repository) RecordPermanentFailure(
@@ -378,6 +423,13 @@ func (r *Repository) recordOutcome(
 				THEN NOW() + make_interval(secs => $4::double precision)
 				ELSE NULL
 			END,
+			delivered_at = CASE WHEN $3 = 'delivered' THEN NOW() ELSE delivered_at END,
+			bounced_at = CASE WHEN $3 = 'bounced' THEN NOW() ELSE bounced_at END,
+			unknown_at = CASE WHEN $3 = 'unknown' THEN NOW() ELSE unknown_at END,
+			last_smtp_code = NULLIF($5, 0),
+			last_enhanced_status_code = NULLIF($6, ''),
+			last_smtp_stage = NULLIF($7, ''),
+			last_error = CASE WHEN $3 IN ('deferred', 'bounced', 'unknown') THEN NULLIF($8, '') ELSE NULL END,
 			delivery_lease_until = NULL,
 			delivery_lease_token = NULL,
 			updated_at = NOW()
@@ -390,6 +442,10 @@ func (r *Repository) recordOutcome(
 		job.LeaseToken,
 		recipientStatus,
 		retryAfter.Seconds(),
+		smtpCode,
+		details.EnhancedStatusCode,
+		details.Stage,
+		response,
 	)
 	if err != nil {
 		return fmt.Errorf("update recipient status: %w", err)
@@ -407,9 +463,14 @@ func (r *Repository) recordOutcome(
 			enhanced_status_code,
 			smtp_stage,
 			response,
+			remote_host,
+			tls_used,
+			tls_mode,
+			tls_version,
+			tls_cipher_suite,
 			attempted_at
 		)
-		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, NOW())
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
 	`,
 		job.RecipientID,
 		job.Attempts,
@@ -418,9 +479,43 @@ func (r *Repository) recordOutcome(
 		nullableString(details.EnhancedStatusCode),
 		nullableString(details.Stage),
 		response,
+		nullableString(details.RemoteHost),
+		details.TLSUsed,
+		nullableString(details.TLSMode),
+		nullableString(details.TLSVersion),
+		nullableString(details.TLSCipherSuite),
 	)
 	if err != nil {
 		return fmt.Errorf("insert delivery attempt: %w", err)
+	}
+
+	eventType := attemptStatus
+	if recipientStatus == "bounced" && attemptStatus == "temporary_failure" {
+		eventType = "retry_exhausted"
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO delivery_status_events (
+			recipient_id, from_status, to_status, event_type,
+			smtp_code, enhanced_status_code, smtp_stage, diagnostic,
+			remote_host, tls_used, tls_mode, tls_version, tls_cipher_suite
+		)
+		VALUES ($1::uuid, 'delivering', $2, $3, $4, $5, $6, NULLIF($7, ''), $8, $9, $10, $11, $12)
+	`,
+		job.RecipientID,
+		recipientStatus,
+		eventType,
+		nullableSMTPCode(smtpCode),
+		nullableString(details.EnhancedStatusCode),
+		nullableString(details.Stage),
+		response,
+		nullableString(details.RemoteHost),
+		details.TLSUsed,
+		nullableString(details.TLSMode),
+		nullableString(details.TLSVersion),
+		nullableString(details.TLSCipherSuite),
+	)
+	if err != nil {
+		return fmt.Errorf("insert delivery status event: %w", err)
 	}
 
 	if recipientStatus == "deferred" {

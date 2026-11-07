@@ -250,7 +250,7 @@ func TestConnectToHostRequiresSTARTTLSWhenConfigured(t *testing.T) {
 		DeliveryTimeout:  2 * time.Second,
 	}, nil, &targetDialer{target: listener.Addr().String()})
 
-	_, err = client.connectToHost(context.Background(), "mx.example.test", "203.0.113.20:25")
+	_, err = client.connectToHost(context.Background(), "mx.example.test", "203.0.113.20:25", TLSModeRequiredSTARTTLS)
 	if err == nil {
 		t.Fatal("connectToHost() succeeded without STARTTLS; want temporary policy error")
 	}
@@ -286,7 +286,7 @@ func TestConnectToHostSendsEHLOAndReadsCapabilities(t *testing.T) {
 	}()
 
 	client := newClient(Config{EHLOName: "outbound.mailforge.test", OperationTimeout: time.Second}, nil, &targetDialer{target: listener.Addr().String()})
-	session, err := client.connectToHost(context.Background(), "mx.example.test", "203.0.113.20:25")
+	session, err := client.connectToHost(context.Background(), "mx.example.test", "203.0.113.20:25", TLSModeStartTLS)
 	if err != nil {
 		t.Fatalf("connectToHost(): %v", err)
 	}

@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
@@ -15,10 +16,29 @@ const (
 	defaultEHLOName         = "localhost"
 )
 
+// TLSMode determines how an SMTP connection establishes transport security.
+type TLSMode string
+
+const (
+	// TLSModeNone disables TLS. Use only for trusted local development relays.
+	TLSModeNone TLSMode = "none"
+	// TLSModeStartTLS upgrades to TLS when the server advertises STARTTLS.
+	TLSModeStartTLS TLSMode = "starttls"
+	// TLSModeRequiredSTARTTLS fails the delivery attempt if STARTTLS is unavailable.
+	TLSModeRequiredSTARTTLS TLSMode = "required-starttls"
+	// TLSModeImplicit starts TLS immediately after TCP connection, before SMTP greeting.
+	TLSModeImplicit TLSMode = "implicit"
+)
+
 type Config struct {
 	RelayHost       string
 	RelayPort       int
+	RelayTLSMode    TLSMode
 	RequireSTARTTLS bool
+
+	// TLSConfig optionally provides custom trust roots and client certificates.
+	// Certificate verification is always enabled; InsecureSkipVerify is rejected.
+	TLSConfig *tls.Config
 
 	// EHLOName is the public hostname MailForge presents in EHLO/HELO.
 	// Configure this to the server's externally resolvable FQDN in production.
@@ -54,8 +74,8 @@ func NewClient() *Client {
 // NewClientWithConfig creates a direct-to-MX client with explicit timeout
 // settings. RelayHost/RelayPort are reserved for NewRelayClient.
 func NewClientWithConfig(cfg Config) (*Client, error) {
-	if cfg.RelayHost != "" || cfg.RelayPort != 0 {
-		return nil, fmt.Errorf("direct MX client cannot use relay host or port; use NewRelayClient")
+	if cfg.RelayHost != "" || cfg.RelayPort != 0 || cfg.RelayTLSMode != "" {
+		return nil, fmt.Errorf("direct MX client cannot use relay configuration; use NewRelayClient")
 	}
 	if err := validateConfig(&cfg); err != nil {
 		return nil, err
@@ -69,6 +89,28 @@ func NewRelayClient(cfg Config) (*Client, error) {
 	}
 	if cfg.RelayPort < 1 || cfg.RelayPort > 65535 {
 		return nil, fmt.Errorf("invalid relay port: %d", cfg.RelayPort)
+	}
+	if cfg.RelayTLSMode == "" {
+		// Select the conventional secure mode for common submission ports.
+		// Other ports keep the legacy plaintext default for local relay setups.
+		switch cfg.RelayPort {
+		case 465:
+			cfg.RelayTLSMode = TLSModeImplicit
+		case 587:
+			cfg.RelayTLSMode = TLSModeRequiredSTARTTLS
+		case 25:
+			if cfg.RequireSTARTTLS {
+				cfg.RelayTLSMode = TLSModeRequiredSTARTTLS
+			} else {
+				cfg.RelayTLSMode = TLSModeStartTLS
+			}
+		default:
+			if cfg.RequireSTARTTLS {
+				cfg.RelayTLSMode = TLSModeRequiredSTARTTLS
+			} else {
+				cfg.RelayTLSMode = TLSModeNone
+			}
+		}
 	}
 	if err := validateConfig(&cfg); err != nil {
 		return nil, err
@@ -92,6 +134,20 @@ func validateConfig(cfg *Config) error {
 	if err := validateEHLOName(cfg.EHLOName); err != nil {
 		return fmt.Errorf("invalid SMTP EHLO name: %w", err)
 	}
+	if cfg.RelayTLSMode == "" {
+		cfg.RelayTLSMode = TLSModeNone
+	}
+	switch cfg.RelayTLSMode {
+	case TLSModeNone, TLSModeStartTLS, TLSModeRequiredSTARTTLS, TLSModeImplicit:
+	default:
+		return fmt.Errorf("invalid SMTP relay TLS mode %q", cfg.RelayTLSMode)
+	}
+	if cfg.TLSConfig != nil {
+		if cfg.TLSConfig.InsecureSkipVerify {
+			return fmt.Errorf("SMTP TLS certificate verification cannot be disabled")
+		}
+		cfg.TLSConfig = cfg.TLSConfig.Clone()
+	}
 	return nil
 }
 
@@ -104,6 +160,7 @@ func newClient(cfg Config, resolver mxResolver, dialer contextDialer) *Client {
 			ConnectTimeout:   defaultConnectTimeout,
 			OperationTimeout: defaultOperationTimeout,
 			DeliveryTimeout:  defaultDeliveryTimeout,
+			RelayTLSMode:     TLSModeNone,
 		}
 	}
 	if resolver == nil {
@@ -116,6 +173,24 @@ func newClient(cfg Config, resolver mxResolver, dialer contextDialer) *Client {
 		}
 	}
 	return &Client{resolver: resolver, dialer: dialer, config: cfg}
+}
+
+func (c *Client) tlsConfigForServer(serverName string) *tls.Config {
+	var cfg *tls.Config
+	if c.config.TLSConfig != nil {
+		cfg = c.config.TLSConfig.Clone()
+	} else {
+		cfg = &tls.Config{}
+	}
+	cfg.ServerName = serverName
+	// SMTP is not an HTTP/2 application protocol. Never negotiate ALPN here.
+	cfg.NextProtos = nil
+	if cfg.MinVersion < tls.VersionTLS12 {
+		cfg.MinVersion = tls.VersionTLS12
+	}
+	// validateConfig rejects InsecureSkipVerify; leave normal PKI verification on.
+	cfg.InsecureSkipVerify = false
+	return cfg
 }
 
 // validateEHLOName prevents command injection and ensures the identity is an
