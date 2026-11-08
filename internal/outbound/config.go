@@ -7,6 +7,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"mailforge/internal/dkimsign"
 )
 
 const (
@@ -35,6 +37,11 @@ type Config struct {
 	RelayPort       int
 	RelayTLSMode    TLSMode
 	RequireSTARTTLS bool
+
+	// DKIMSigner optionally signs the sanitized outbound message. When set,
+	// signing failures fail the recipient delivery closed; MailForge never
+	// silently falls back to an unsigned message.
+	DKIMSigner *dkimsign.Signer
 
 	// TLSConfig optionally provides custom trust roots and client certificates.
 	// Certificate verification is always enabled; InsecureSkipVerify is rejected.

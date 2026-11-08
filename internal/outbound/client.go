@@ -66,6 +66,19 @@ func (c *Client) SendWithResult(
 	if err != nil {
 		return DeliveryInfo{}, &DeliveryError{Message: fmt.Sprintf("invalid message headers: %v", err), Permanent: true}
 	}
+	// Sign only after Bcc headers have been removed. The signature therefore
+	// covers the exact RFC 5322 message that will be transmitted and cannot
+	// disclose blind-copy envelope recipients.
+	if c.config.DKIMSigner != nil {
+		deliveryMessage, err = c.config.DKIMSigner.Sign(deliveryMessage)
+		if err != nil {
+			return DeliveryInfo{}, &DeliveryError{
+				Message:   fmt.Sprintf("DKIM signing failed: %v", err),
+				Permanent: true,
+				Stage:     "dkim_sign",
+			}
+		}
+	}
 
 	deliveryCtx, cancel := context.WithTimeout(ctx, c.config.DeliveryTimeout)
 	defer cancel()

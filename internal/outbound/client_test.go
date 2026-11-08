@@ -4,12 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"errors"
 	"io"
 	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"mailforge/internal/dkimsign"
 )
 
 func TestSendTimesOutWhenRelayNeverSendsGreeting(t *testing.T) {
@@ -181,11 +185,20 @@ func TestSendStripsBccHeadersBeforeSMTPData(t *testing.T) {
 		}
 	}()
 
+	dkimKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate DKIM test key: %v", err)
+	}
+	dkimSigner, err := dkimsign.NewSigner("example.com", "mailforge-test", dkimKey)
+	if err != nil {
+		t.Fatalf("create DKIM test signer: %v", err)
+	}
 	client, err := NewRelayClient(Config{
 		RelayHost:        "127.0.0.1",
 		RelayPort:        port,
 		OperationTimeout: time.Second,
 		DeliveryTimeout:  3 * time.Second,
+		DKIMSigner:       dkimSigner,
 	})
 	if err != nil {
 		t.Fatalf("NewRelayClient: %v", err)
@@ -206,7 +219,7 @@ func TestSendStripsBccHeadersBeforeSMTPData(t *testing.T) {
 		t.Fatalf("test SMTP server: %v", got.err)
 	}
 	data := string(got.data)
-	for _, expected := range []string{"To: visible@example.net", "Cc: copy@example.org", "Reply-To: replies@example.net", "Subject: privacy test", "body"} {
+	for _, expected := range []string{"DKIM-Signature:", "To: visible@example.net", "Cc: copy@example.org", "Reply-To: replies@example.net", "Subject: privacy test", "body"} {
 		if !strings.Contains(data, expected) {
 			t.Errorf("SMTP DATA missing %q: %q", expected, data)
 		}

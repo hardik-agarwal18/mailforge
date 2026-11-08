@@ -16,6 +16,7 @@ import (
 
 	"mailforge/internal/database"
 	"mailforge/internal/delivery"
+	"mailforge/internal/dkimsign"
 	"mailforge/internal/observability"
 	"mailforge/internal/outbound"
 )
@@ -96,6 +97,12 @@ func run() error {
 		"SMTP_DELIVERY_TIMEOUT",
 		defaultDeliveryTimeout,
 	)
+	if err != nil {
+		return err
+	}
+	// Validate and load DKIM credentials before opening database/Redis
+	// connections so incomplete or invalid signing configuration fails fast.
+	dkimSigner, err := loadDKIMSignerFromEnv()
 	if err != nil {
 		return err
 	}
@@ -255,6 +262,12 @@ func run() error {
 		DeliveryTimeout:  deliveryTimeout,
 		RequireSTARTTLS:  strings.EqualFold(os.Getenv("SMTP_REQUIRE_STARTTLS"), "true"),
 	}
+	smtpConfig.DKIMSigner = dkimSigner
+	if dkimSigner != nil {
+		log.Printf("Outbound DKIM signing enabled: domain=%s selector=%s", strings.TrimSpace(os.Getenv("SMTP_DKIM_DOMAIN")), strings.TrimSpace(os.Getenv("SMTP_DKIM_SELECTOR")))
+	} else {
+		log.Println("Outbound DKIM signing disabled")
+	}
 
 	var smtpClient *outbound.Client
 
@@ -400,6 +413,35 @@ func run() error {
 
 	log.Println("MailForge delivery worker stopped gracefully")
 	return nil
+}
+
+func loadDKIMSignerFromEnv() (*dkimsign.Signer, error) {
+	domain := strings.TrimSpace(os.Getenv("SMTP_DKIM_DOMAIN"))
+	selector := strings.TrimSpace(os.Getenv("SMTP_DKIM_SELECTOR"))
+	keyPath := strings.TrimSpace(os.Getenv("SMTP_DKIM_PRIVATE_KEY_FILE"))
+
+	configured := 0
+	for _, value := range []string{domain, selector, keyPath} {
+		if value != "" {
+			configured++
+		}
+	}
+	if configured == 0 {
+		return nil, nil
+	}
+	if configured != 3 {
+		return nil, fmt.Errorf("DKIM configuration is incomplete: set SMTP_DKIM_DOMAIN, SMTP_DKIM_SELECTOR, and SMTP_DKIM_PRIVATE_KEY_FILE together")
+	}
+
+	key, err := dkimsign.LoadRSAPrivateKey(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load outbound DKIM key: %w", err)
+	}
+	signer, err := dkimsign.NewSigner(domain, selector, key)
+	if err != nil {
+		return nil, fmt.Errorf("configure outbound DKIM signer: %w", err)
+	}
+	return signer, nil
 }
 
 // --------------------------------------------------
