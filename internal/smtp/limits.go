@@ -1,15 +1,17 @@
 package smtp
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
 
-// ServerLimits bounds SMTP resource consumption. Authentication attempt counters
-// are process-local; deployments with multiple submission replicas should put
-// authentication counters in a shared store. Message quotas are enforced
+// ServerLimits bounds SMTP resource consumption. Authentication attempt limits
+// are applied by the configured AuthAttemptLimiter. Message quotas are enforced
 // separately by the PostgreSQL message repository.
 type ServerLimits struct {
 	MaxConnections          int
@@ -121,4 +123,80 @@ func (l *fixedWindowLimiter) Allow(key string, limit int, window time.Duration) 
 func limiterKey(namespace, value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return namespace + ":" + hex.EncodeToString(sum[:])
+}
+
+// AllowPair applies the IP and username counters atomically within this process.
+// It is retained as a development/test fallback; production submission servers
+// should use RedisAuthAttemptLimiter so all replicas share the same counters.
+func (l *fixedWindowLimiter) AllowPair(ipKey, usernameKey string, ipLimit, usernameLimit int, window time.Duration) bool {
+	if l == nil || ipKey == "" || usernameKey == "" || ipLimit < 1 || usernameLimit < 1 || window <= 0 {
+		return false
+	}
+
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	missing := 0
+	if _, exists := l.entries[ipKey]; !exists {
+		missing++
+	}
+	if _, exists := l.entries[usernameKey]; !exists {
+		missing++
+	}
+	if len(l.entries)+missing > l.maxEntries {
+		for existingKey, existing := range l.entries {
+			if now.Sub(existing.lastSeen) > 2*existing.window {
+				delete(l.entries, existingKey)
+			}
+		}
+		missing = 0
+		if _, exists := l.entries[ipKey]; !exists {
+			missing++
+		}
+		if _, exists := l.entries[usernameKey]; !exists {
+			missing++
+		}
+		if len(l.entries)+missing > l.maxEntries {
+			return false
+		}
+	}
+
+	ipEntry := activeWindowEntry(l.entries[ipKey], window, now)
+	usernameEntry := activeWindowEntry(l.entries[usernameKey], window, now)
+	if ipEntry.count >= ipLimit || usernameEntry.count >= usernameLimit {
+		return false
+	}
+	ipEntry.count++
+	ipEntry.lastSeen = now
+	usernameEntry.count++
+	usernameEntry.lastSeen = now
+	l.entries[ipKey] = ipEntry
+	l.entries[usernameKey] = usernameEntry
+	return true
+}
+
+func activeWindowEntry(entry windowCounter, window time.Duration, now time.Time) windowCounter {
+	if entry.startedAt.IsZero() || now.Sub(entry.startedAt) >= window || entry.window != window {
+		return windowCounter{startedAt: now, lastSeen: now, window: window}
+	}
+	return entry
+}
+
+type localAuthAttemptLimiter struct {
+	limiter *fixedWindowLimiter
+}
+
+func (l *localAuthAttemptLimiter) Allow(ctx context.Context, clientIP, username string, ipLimit, usernameLimit int, window time.Duration) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if l == nil || l.limiter == nil {
+		return false, fmt.Errorf("local SMTP authentication limiter is not configured")
+	}
+	return l.limiter.AllowPair(
+		limiterKey("auth-ip", clientIP),
+		limiterKey("auth-user", strings.ToLower(strings.TrimSpace(username))),
+		ipLimit, usernameLimit, window,
+	), nil
 }

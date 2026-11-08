@@ -45,7 +45,7 @@ type Server struct {
 	connectionSlots chan struct{}
 	authSlots       chan struct{}
 	dataSlots       chan struct{}
-	rateLimiter     *fixedWindowLimiter
+	authRateLimiter AuthAttemptLimiter
 }
 
 // NewServer creates an unauthenticated SMTP listener for trusted local message
@@ -61,8 +61,10 @@ func NewServer(
 }
 
 // NewSubmissionServer creates an SMTP submission listener. STARTTLS and AUTH are
-// mandatory before accepting a message. The supplied TLS configuration must
-// contain a certificate (or a certificate callback).
+// mandatory before accepting a message. It uses a process-local limiter and is
+// intended for tests and single-process development; multi-replica production
+// deployments should use NewSubmissionServerWithRateLimiter. The TLS configuration
+// must contain a certificate (or a certificate callback).
 func NewSubmissionServer(
 	address string,
 	messageAcceptor MessageAcceptor,
@@ -74,7 +76,9 @@ func NewSubmissionServer(
 }
 
 // NewSubmissionServerWithLimits creates an authenticated submission server
-// with explicit resource and abuse-prevention limits.
+// with explicit resource and abuse-prevention limits. It uses a bounded
+// process-local AUTH limiter for tests and single-process development.
+// Multi-instance production servers should use NewSubmissionServerWithRateLimiter.
 func NewSubmissionServerWithLimits(
 	address string,
 	messageAcceptor MessageAcceptor,
@@ -98,7 +102,32 @@ func NewSubmissionServerWithLimits(
 		config.MinVersion = tls.VersionTLS12
 	}
 
-	return newServer(address, messageAcceptor, metrics, true, config, authenticator, limits), nil
+	server := newServer(address, messageAcceptor, metrics, true, config, authenticator, limits)
+	server.authRateLimiter = &localAuthAttemptLimiter{limiter: newFixedWindowLimiter(50_000)}
+	return server, nil
+}
+
+// NewSubmissionServerWithRateLimiter creates an authenticated submission server
+// with an injected shared attempt limiter. Production multi-instance deployments
+// should pass NewRedisAuthAttemptLimiter; limiter failures are always fail-closed.
+func NewSubmissionServerWithRateLimiter(
+	address string,
+	messageAcceptor MessageAcceptor,
+	metrics MetricsRecorder,
+	tlsConfig *tls.Config,
+	authenticator Authenticator,
+	limits ServerLimits,
+	rateLimiter AuthAttemptLimiter,
+) (*Server, error) {
+	if rateLimiter == nil {
+		return nil, fmt.Errorf("SMTP authentication rate limiter is required")
+	}
+	server, err := NewSubmissionServerWithLimits(address, messageAcceptor, metrics, tlsConfig, authenticator, limits)
+	if err != nil {
+		return nil, err
+	}
+	server.authRateLimiter = rateLimiter
+	return server, nil
 }
 
 func newServer(
@@ -122,7 +151,7 @@ func newServer(
 		connectionSlots: make(chan struct{}, limits.MaxConnections),
 		authSlots:       make(chan struct{}, limits.MaxConcurrentAuth),
 		dataSlots:       make(chan struct{}, limits.MaxConcurrentData),
-		rateLimiter:     newFixedWindowLimiter(50_000),
+		authRateLimiter: &localAuthAttemptLimiter{limiter: newFixedWindowLimiter(50_000)},
 	}
 }
 
@@ -328,8 +357,20 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 			}
 
 			clientIP := remoteIP(conn)
-			if !s.rateLimiter.Allow(limiterKey("auth-ip", clientIP), s.limits.AuthAttemptsPerIP, s.limits.AuthWindow) ||
-				!s.rateLimiter.Allow(limiterKey("auth-user", strings.ToLower(username)), s.limits.AuthAttemptsPerUsername, s.limits.AuthWindow) {
+			rateLimitCtx, cancelRateLimit := context.WithTimeout(ctx, authenticationTimeout)
+			allowed, rateLimitErr := s.authRateLimiter.Allow(
+				rateLimitCtx, clientIP, username,
+				s.limits.AuthAttemptsPerIP, s.limits.AuthAttemptsPerUsername, s.limits.AuthWindow,
+			)
+			cancelRateLimit()
+			if rateLimitErr != nil {
+				// Fail closed: never bypass authentication throttling when Redis or
+				// another configured shared limiter is unavailable.
+				log.Printf("SMTP authentication rate limiter unavailable: %v", rateLimitErr)
+				_ = writeReply(conn, "454 4.7.0 Temporary authentication rate-limit failure")
+				return
+			}
+			if !allowed {
 				_ = writeReply(conn, "454 4.7.0 Too many authentication attempts; try again later")
 				return
 			}

@@ -17,6 +17,8 @@ import (
 	"mailforge/internal/observability"
 	"mailforge/internal/smtp"
 	"mailforge/internal/smtpauth"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -52,6 +54,38 @@ func main() {
 	}
 	defer pool.Close()
 
+	redisAddr := envString("REDIS_ADDR", "127.0.0.1:6379")
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:         redisAddr,
+		Password:     os.Getenv("REDIS_PASSWORD"),
+		DB:           0,
+		PoolSize:     20,
+		DialTimeout:  3 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+		MaxRetries:   1,
+	})
+	defer func() {
+		if err := redisClient.Close(); err != nil {
+			log.Printf("Redis shutdown failed: %v", err)
+		}
+	}()
+
+	redisCtx, cancelRedis := context.WithTimeout(ctx, 5*time.Second)
+	if err := redisClient.Ping(redisCtx).Err(); err != nil {
+		cancelRedis()
+		log.Fatalf("Redis is required for distributed SMTP authentication rate limiting: %v", err)
+	}
+	cancelRedis()
+	rateLimiter, err := smtp.NewRedisAuthAttemptLimiter(
+		redisClient,
+		envString("SMTP_AUTH_RATE_LIMIT_PREFIX", "mailforge:smtp:auth:v1"),
+	)
+	if err != nil {
+		log.Fatalf("configure distributed SMTP authentication rate limiter: %v", err)
+	}
+	log.Printf("Distributed SMTP authentication rate limiting enabled via Redis at %s (fail-closed)", redisAddr)
+
 	limits := smtp.DefaultServerLimits()
 	limits.MaxConnections = envInt("SMTP_MAX_CONNECTIONS", limits.MaxConnections)
 	limits.MaxRecipients = envInt("SMTP_MAX_RECIPIENTS", limits.MaxRecipients)
@@ -59,6 +93,7 @@ func main() {
 	limits.MaxConcurrentData = envInt("SMTP_MAX_CONCURRENT_DATA", limits.MaxConcurrentData)
 	limits.AuthAttemptsPerIP = envInt("SMTP_AUTH_ATTEMPTS_PER_IP", limits.AuthAttemptsPerIP)
 	limits.AuthAttemptsPerUsername = envInt("SMTP_AUTH_ATTEMPTS_PER_USERNAME", limits.AuthAttemptsPerUsername)
+	limits.AuthWindow = time.Duration(envInt("SMTP_AUTH_WINDOW_SECONDS", int(limits.AuthWindow.Seconds()))) * time.Second
 
 	quotas := message.DefaultSubmissionQuotaLimits()
 	quotas.MaxMessagesPerAccountPerHour = envInt("SMTP_MAX_SUBMISSIONS_PER_ACCOUNT_PER_HOUR", quotas.MaxMessagesPerAccountPerHour)
@@ -82,13 +117,14 @@ func main() {
 		submissionAddr = ":587"
 	}
 
-	submissionServer, err := smtp.NewSubmissionServerWithLimits(
+	submissionServer, err := smtp.NewSubmissionServerWithRateLimiter(
 		submissionAddr,
 		messageService,
 		metrics,
 		tlsConfig,
 		credentialRepository,
 		limits,
+		rateLimiter,
 	)
 	if err != nil {
 		log.Fatalf("configure SMTP submission server: %v", err)
@@ -122,6 +158,13 @@ func main() {
 	if err := submissionServer.StartContext(ctx); err != nil {
 		log.Fatalf("SMTP submission server failed: %v", err)
 	}
+}
+
+func envString(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func envInt(name string, fallback int) int {

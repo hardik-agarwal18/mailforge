@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"errors"
 	"math/big"
 	"net"
 	"strings"
@@ -31,6 +32,12 @@ func (a *testAcceptor) Accept(_ context.Context, input message.NewMessage) (mess
 	a.calls++
 	a.input = input
 	return message.StoredMessage{ID: "stored-id", MessageID: "<test@mailforge.local>"}, nil
+}
+
+type authAttemptLimiterFunc func(context.Context, string, string, int, int, time.Duration) (bool, error)
+
+func (f authAttemptLimiterFunc) Allow(ctx context.Context, ip, username string, ipLimit, usernameLimit int, window time.Duration) (bool, error) {
+	return f(ctx, ip, username, ipLimit, usernameLimit, window)
 }
 
 type testAuthenticator struct{}
@@ -285,6 +292,56 @@ func TestSubmissionRequiresTLSAndAuthenticationAndBindsSender(t *testing.T) {
 	}
 }
 
+func TestSubmissionFailsClosedWhenAuthRateLimiterUnavailable(t *testing.T) {
+	limiter := authAttemptLimiterFunc(func(context.Context, string, string, int, int, time.Duration) (bool, error) {
+		return false, errors.New("Redis unavailable")
+	})
+	server, err := NewSubmissionServerWithRateLimiter(
+		"127.0.0.1:0", &testAcceptor{}, nil, testTLSConfig(t), testAuthenticator{}, DefaultServerLimits(), limiter,
+	)
+	if err != nil {
+		t.Fatalf("NewSubmissionServerWithRateLimiter() error = %v", err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		server.handleConnection(serverConn)
+		close(done)
+	}()
+	defer clientConn.Close()
+
+	reader := bufio.NewReader(clientConn)
+	assertCode(t, readReply(t, reader), "220")
+	writeCommand(t, clientConn, "EHLO client.example")
+	readReply(t, reader)
+	writeCommand(t, clientConn, "STARTTLS")
+	assertCode(t, readReply(t, reader), "220")
+
+	tlsClient := tls.Client(clientConn, &tls.Config{
+		InsecureSkipVerify: true, // Test certificate is self-signed.
+		MinVersion:         tls.VersionTLS12,
+	})
+	handshakeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tlsClient.HandshakeContext(handshakeCtx); err != nil {
+		t.Fatalf("TLS handshake: %v", err)
+	}
+	reader = bufio.NewReader(tlsClient)
+	writeCommand(t, tlsClient, "EHLO client.example")
+	readReply(t, reader)
+
+	plainAuth := base64.StdEncoding.EncodeToString([]byte("\x00hardik\x00test-password"))
+	writeCommand(t, tlsClient, "AUTH PLAIN "+plainAuth)
+	reply := readReply(t, reader)
+	assertCode(t, reply, "454")
+	if !strings.Contains(strings.Join(reply, "\n"), "Temporary authentication rate-limit failure") {
+		t.Fatalf("rate-limiter outage reply = %v, want temporary fail-closed response", reply)
+	}
+	_ = tlsClient.Close()
+	<-done
+}
+
 func TestUnauthenticatedListenerMustBindToLoopback(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -319,6 +376,15 @@ func TestStartContextRefusesPublicUnauthenticatedListener(t *testing.T) {
 	server := NewServer("0.0.0.0:0", &testAcceptor{}, nil)
 	if err := server.StartContext(context.Background()); err == nil {
 		t.Fatal("StartContext() unexpectedly started an unauthenticated public listener")
+	}
+}
+
+func TestNewSubmissionServerWithRateLimiterRequiresLimiter(t *testing.T) {
+	_, err := NewSubmissionServerWithRateLimiter(
+		"127.0.0.1:0", &testAcceptor{}, nil, testTLSConfig(t), testAuthenticator{}, DefaultServerLimits(), nil,
+	)
+	if err == nil {
+		t.Fatal("expected missing authentication rate limiter to fail")
 	}
 }
 
@@ -437,10 +503,9 @@ func TestRecipientLimitIsEnforced(t *testing.T) {
 
 func TestSMTPTransactionDeliversEachUniqueRecipientOnce(t *testing.T) {
 	acceptor := &testAcceptor{}
-	server := &Server{
-		messageAcceptor: acceptor,
-		limits:          normalizeServerLimits(ServerLimits{MaxRecipients: 3}),
-	}
+	server := NewServer("127.0.0.1:0", acceptor, nil)
+	server.limits = normalizeServerLimits(ServerLimits{MaxRecipients: 3})
+
 	serverConn, clientConn := net.Pipe()
 	done := make(chan struct{})
 	go func() {

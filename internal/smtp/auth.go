@@ -3,6 +3,7 @@ package smtp
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 var ErrInvalidCredentials = errors.New("invalid SMTP credentials")
@@ -19,4 +20,11 @@ type Identity struct {
 // Authenticator verifies SMTP AUTH credentials and returns the sender identity.
 type Authenticator interface {
 	Authenticate(ctx context.Context, username, password string) (Identity, error)
+}
+
+// AuthAttemptLimiter atomically applies both the client-IP and username
+// authentication-attempt limits. Implementations must fail closed: an
+// unavailable limiter must return an error rather than permit authentication.
+type AuthAttemptLimiter interface {
+	Allow(ctx context.Context, clientIP, username string, ipLimit, usernameLimit int, window time.Duration) (bool, error)
 }
