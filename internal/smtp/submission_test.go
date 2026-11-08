@@ -232,7 +232,8 @@ func TestSubmissionRequiresTLSAndAuthenticationAndBindsSender(t *testing.T) {
 
 	writeCommand(t, tlsClient, "DATA")
 	assertCode(t, readReply(t, reader), "354")
-	if _, err := tlsClient.Write([]byte("To: visible@example.net\r\n" +
+	if _, err := tlsClient.Write([]byte("From: sender@example.com\r\n" +
+		"To: visible@example.net\r\n" +
 		"Cc: copy@example.org\r\n" +
 		"Bcc: blind@example.com\r\n" +
 		"Reply-To: replies@example.net\r\n" +
@@ -251,6 +252,9 @@ func TestSubmissionRequiresTLSAndAuthenticationAndBindsSender(t *testing.T) {
 	}
 	if acceptor.input.Sender != "sender@example.com" {
 		t.Fatalf("stored envelope sender = %q", acceptor.input.Sender)
+	}
+	if acceptor.input.AuthenticatedEmail != "sender@example.com" {
+		t.Fatalf("authenticated submission identity = %q, want sender@example.com", acceptor.input.AuthenticatedEmail)
 	}
 	if len(acceptor.input.Recipients) != 1 || acceptor.input.Recipients[0] != "recipient@example.net" {
 		t.Fatalf("stored recipients = %v", acceptor.input.Recipients)

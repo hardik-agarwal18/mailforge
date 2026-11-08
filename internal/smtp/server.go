@@ -454,14 +454,19 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 			if s.submission {
 				clientIP = remoteIP(conn)
 			}
+			authenticatedEmail := ""
+			if s.submission {
+				authenticatedEmail = session.AuthenticatedEmail
+			}
 			acceptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			stored, err := s.messageAcceptor.Accept(
 				acceptCtx,
 				message.NewMessage{
-					Sender:     session.Sender,
-					ClientIP:   clientIP,
-					Recipients: session.Recipients,
-					RawMessage: session.MessageData,
+					Sender:             session.Sender,
+					AuthenticatedEmail: authenticatedEmail,
+					ClientIP:           clientIP,
+					Recipients:         session.Recipients,
+					RawMessage:         session.MessageData,
 				},
 			)
 			cancel()
@@ -480,6 +485,8 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 					_ = writeReply(conn, "554 5.6.0 Invalid sender envelope")
 				case errors.Is(err, message.ErrInvalidRecipient):
 					_ = writeReply(conn, "554 5.6.0 Invalid recipient envelope")
+				case errors.Is(err, message.ErrUnauthorizedSubmissionIdentity):
+					_ = writeReply(conn, "554 5.7.1 Sender identity is not authorized for this account")
 				case errors.Is(err, message.ErrInvalidMessageFormat):
 					_ = writeReply(conn, "554 5.6.0 Message content is not valid RFC 5322/MIME")
 				case errors.Is(err, message.ErrMIMEMessageTooLarge):

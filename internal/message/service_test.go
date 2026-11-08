@@ -204,3 +204,78 @@ func TestAcceptStoresToCcBccAndReplyToMetadata(t *testing.T) {
 		t.Fatal("original message was modified; raw storage must retain the Bcc header")
 	}
 }
+
+func TestAcceptEnforcesAuthenticatedSubmissionIdentity(t *testing.T) {
+	tests := []struct {
+		name         string
+		envelopeFrom string
+		message      string
+		wantError    bool
+	}{
+		{
+			name:         "matching From",
+			envelopeFrom: "sender@example.com",
+			message:      "From: Sender <sender@EXAMPLE.COM>\r\n\r\nhello\r\n",
+		},
+		{
+			name:         "missing From",
+			envelopeFrom: "sender@example.com",
+			message:      "Subject: no visible author\r\n\r\nhello\r\n",
+			wantError:    true,
+		},
+		{
+			name:         "spoofed From",
+			envelopeFrom: "sender@example.com",
+			message:      "From: ceo@another-company.com\r\n\r\nhello\r\n",
+			wantError:    true,
+		},
+		{
+			name:         "multiple From mailboxes",
+			envelopeFrom: "sender@example.com",
+			message:      "From: sender@example.com, attacker@example.net\r\nSender: sender@example.com\r\n\r\nhello\r\n",
+			wantError:    true,
+		},
+		{
+			name:         "spoofed Sender header",
+			envelopeFrom: "sender@example.com",
+			message:      "From: sender@example.com\r\nSender: attacker@example.net\r\n\r\nhello\r\n",
+			wantError:    true,
+		},
+		{
+			name:         "spoofed envelope sender",
+			envelopeFrom: "attacker@example.net",
+			message:      "From: sender@example.com\r\n\r\nhello\r\n",
+			wantError:    true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			creator := &recordingCreator{}
+			service := NewService(creator)
+			_, err := service.Accept(context.Background(), NewMessage{
+				Sender:             test.envelopeFrom,
+				AuthenticatedEmail: "sender@example.com",
+				Recipients:         []string{"recipient@example.net"},
+				RawMessage:         []byte(test.message),
+			})
+
+			if test.wantError {
+				if !errors.Is(err, ErrUnauthorizedSubmissionIdentity) {
+					t.Fatalf("Accept() error = %v, want ErrUnauthorizedSubmissionIdentity", err)
+				}
+				if creator.calls != 0 {
+					t.Fatalf("repository Create called %d times for unauthorized submission", creator.calls)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Accept() rejected authorized submission: %v", err)
+			}
+			if creator.calls != 1 {
+				t.Fatalf("repository Create calls = %d, want 1", creator.calls)
+			}
+		})
+	}
+}
