@@ -102,6 +102,45 @@ func TestAcceptPersistsValidEnvelope(t *testing.T) {
 	}
 }
 
+func TestAcceptDeduplicatesRecipientsBeforePersistence(t *testing.T) {
+	creator := &recordingCreator{}
+	service := NewService(creator)
+	wantRecipients := []string{
+		"Alice@example.net",
+		"alice@example.net", // SMTP local-parts are case-sensitive.
+		"bob@example.net",
+	}
+
+	stored, err := service.Accept(context.Background(), NewMessage{
+		Sender: "sender@example.com",
+		Recipients: []string{
+			"Alice@example.net",
+			"Alice@EXAMPLE.NET", // Same mailbox; domain case is insignificant.
+			"alice@example.net",
+			"bob@example.net",
+			"bob@EXAMPLE.NET",
+		},
+		RawMessage: []byte("Subject: deduplication test\r\n\r\nhello\r\n"),
+	})
+	if err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	if creator.calls != 1 {
+		t.Fatalf("repository Create calls = %d, want 1", creator.calls)
+	}
+	if len(creator.msg.Recipients) != len(wantRecipients) {
+		t.Fatalf("persisted recipients = %v, want %v", creator.msg.Recipients, wantRecipients)
+	}
+	for i := range wantRecipients {
+		if creator.msg.Recipients[i] != wantRecipients[i] {
+			t.Fatalf("persisted recipients = %v, want %v", creator.msg.Recipients, wantRecipients)
+		}
+	}
+	if len(stored.Recipients) != len(wantRecipients) {
+		t.Fatalf("returned recipients = %v, want %v", stored.Recipients, wantRecipients)
+	}
+}
+
 func TestAcceptParsesMIMEBeforePersistence(t *testing.T) {
 	creator := &recordingCreator{}
 	service := NewService(creator)

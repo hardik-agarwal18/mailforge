@@ -1,5 +1,7 @@
 package smtp
 
+import "mailforge/internal/emailaddr"
+
 type State int
 
 const (
@@ -44,4 +46,15 @@ func (s *Session) ResetTransaction() {
 
 func (s *Session) CanReceiveRecipient() bool {
 	return s.State == StateMail || s.State == StateRecipient
+}
+
+// HasRecipient reports whether the transaction already contains the mailbox.
+// Mailbox comparison preserves local-part case and ignores domain case.
+func (s *Session) HasRecipient(address string) bool {
+	for _, recipient := range s.Recipients {
+		if emailaddr.Equal(recipient, address) {
+			return true
+		}
+	}
+	return false
 }

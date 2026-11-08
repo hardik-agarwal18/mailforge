@@ -71,6 +71,10 @@ func (s *Service) Accept(
 			return StoredMessage{}, fmt.Errorf("%w: %v", ErrInvalidRecipient, err)
 		}
 	}
+	// Do not create multiple delivery records for the same SMTP mailbox.
+	// Preserve first-seen order and spelling; local-parts are case-sensitive,
+	// while domain names are case-insensitive.
+	input.Recipients = emailaddr.DeduplicateMailboxes(input.Recipients)
 
 	parsed, err := mimeparser.Parse(input.RawMessage)
 	if err != nil {

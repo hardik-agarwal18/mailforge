@@ -424,10 +424,70 @@ func TestRecipientLimitIsEnforced(t *testing.T) {
 	assertCode(t, readReply(t, reader), "250")
 	writeCommand(t, clientConn, "RCPT TO:<first@example.net>")
 	assertCode(t, readReply(t, reader), "250")
+	// A duplicate is accepted but does not consume another recipient slot.
+	writeCommand(t, clientConn, "RCPT TO:<first@EXAMPLE.NET>")
+	assertCode(t, readReply(t, reader), "250")
 	writeCommand(t, clientConn, "RCPT TO:<second@example.net>")
 	assertCode(t, readReply(t, reader), "452")
 	writeCommand(t, clientConn, "QUIT")
 	assertCode(t, readReply(t, reader), "221")
 	_ = clientConn.Close()
 	<-done
+}
+
+func TestSMTPTransactionDeliversEachUniqueRecipientOnce(t *testing.T) {
+	acceptor := &testAcceptor{}
+	server := &Server{
+		messageAcceptor: acceptor,
+		limits:          normalizeServerLimits(ServerLimits{MaxRecipients: 3}),
+	}
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		server.handleConnection(serverConn)
+		close(done)
+	}()
+	defer clientConn.Close()
+
+	reader := bufio.NewReader(clientConn)
+	assertCode(t, readReply(t, reader), "220")
+	writeCommand(t, clientConn, "EHLO dedupe-client.example")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "MAIL FROM:<sender@example.com>")
+	assertCode(t, readReply(t, reader), "250")
+
+	writeCommand(t, clientConn, "RCPT TO:<Alice@example.net>")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "RCPT TO:<Alice@EXAMPLE.NET>")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "RCPT TO:<alice@example.net>")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "RCPT TO:<bob@example.net>")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "RCPT TO:<carol@example.net>")
+	assertCode(t, readReply(t, reader), "452")
+
+	writeCommand(t, clientConn, "DATA")
+	assertCode(t, readReply(t, reader), "354")
+	if _, err := clientConn.Write([]byte("Subject: duplicate recipient test\r\n\r\nhello\r\n.\r\n")); err != nil {
+		t.Fatalf("write DATA: %v", err)
+	}
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, clientConn, "QUIT")
+	assertCode(t, readReply(t, reader), "221")
+	_ = clientConn.Close()
+	<-done
+
+	want := []string{"Alice@example.net", "alice@example.net", "bob@example.net"}
+	if acceptor.calls != 1 {
+		t.Fatalf("message acceptor calls = %d, want 1", acceptor.calls)
+	}
+	if len(acceptor.input.Recipients) != len(want) {
+		t.Fatalf("accepted recipients = %v, want %v", acceptor.input.Recipients, want)
+	}
+	for i := range want {
+		if acceptor.input.Recipients[i] != want[i] {
+			t.Fatalf("accepted recipients = %v, want %v", acceptor.input.Recipients, want)
+		}
+	}
 }

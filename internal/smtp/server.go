@@ -421,6 +421,13 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 				continue
 			}
 
+			// Repeated RCPT TO commands are accepted but only the first
+			// occurrence is retained for delivery and recipient-limit accounting.
+			if session.HasRecipient(address) {
+				_ = writeReply(conn, "250 2.1.5 Recipient already accepted")
+				continue
+			}
+
 			if len(session.Recipients) >= s.limits.MaxRecipients {
 				_ = writeReply(conn, "452 4.5.3 Too many recipients")
 				continue

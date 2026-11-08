@@ -85,6 +85,37 @@ func Equal(left, right string) bool {
 		strings.EqualFold(leftMailbox.Domain, rightMailbox.Domain)
 }
 
+// DeduplicateMailboxes removes repeated valid SMTP mailboxes while preserving
+// the first occurrence and input order. Local-parts remain case-sensitive;
+// domains are compared case-insensitively, matching Equal.
+//
+// Invalid addresses are retained rather than silently discarded so callers
+// can validate and report them at the appropriate protocol boundary.
+func DeduplicateMailboxes(addresses []string) []string {
+	if len(addresses) < 2 {
+		return append([]string(nil), addresses...)
+	}
+
+	seen := make(map[string]struct{}, len(addresses))
+	unique := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		mailbox, err := ParseMailbox(address)
+		if err != nil {
+			unique = append(unique, address)
+			continue
+		}
+
+		key := mailbox.Local + "\x00" + strings.ToLower(mailbox.Domain)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, address)
+	}
+
+	return unique
+}
+
 func splitMailbox(address string) (local, domain string, err error) {
 	if address[0] == '"' {
 		closeQuote, quoteErr := quotedLocalPartEnd(address)

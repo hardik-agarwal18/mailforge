@@ -109,6 +109,41 @@ func TestEqualUsesCaseSensitiveLocalPartAndCaseInsensitiveDomain(t *testing.T) {
 	}
 }
 
+func TestDeduplicateMailboxesPreservesSMTPComparisonRules(t *testing.T) {
+	input := []string{
+		"Alice@example.net",
+		"Alice@EXAMPLE.NET",
+		"alice@example.net",
+		`"quoted@local"@example.net`,
+		`"quoted@local"@EXAMPLE.NET`,
+		"Bob@example.net",
+	}
+	want := []string{
+		"Alice@example.net",
+		"alice@example.net",
+		`"quoted@local"@example.net`,
+		"Bob@example.net",
+	}
+
+	got := DeduplicateMailboxes(input)
+	if len(got) != len(want) {
+		t.Fatalf("DeduplicateMailboxes() returned %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("DeduplicateMailboxes()[%d] = %q, want %q (full result %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestDeduplicateMailboxesRetainsInvalidInputForValidation(t *testing.T) {
+	input := []string{"invalid", "invalid", "user@example.net"}
+	got := DeduplicateMailboxes(input)
+	if len(got) != len(input) {
+		t.Fatalf("DeduplicateMailboxes() silently removed invalid values: %v", got)
+	}
+}
+
 func TestParseMailboxAcceptsMaximumAddrSpecLength(t *testing.T) {
 	local := strings.Repeat("a", maxLocalLength)
 	domain := strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)

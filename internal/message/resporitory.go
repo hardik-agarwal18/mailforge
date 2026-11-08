@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"mailforge/internal/emailaddr"
 	"mailforge/internal/mimeparser"
 )
 
@@ -44,6 +45,9 @@ func (r *Repository) Create(
 	ctx context.Context,
 	msg StoredMessage,
 ) (string, error) {
+	// Keep the persistence boundary defensive: every unique mailbox should
+	// produce exactly one recipient row, status event, and outbox event.
+	msg.Recipients = emailaddr.DeduplicateMailboxes(msg.Recipients)
 
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
