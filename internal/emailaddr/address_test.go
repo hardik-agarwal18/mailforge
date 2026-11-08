@@ -120,3 +120,27 @@ func TestParseMailboxAcceptsMaximumAddrSpecLength(t *testing.T) {
 		t.Fatalf("maximum-length valid mailbox rejected: %v", err)
 	}
 }
+
+func TestIsAuthorizedMailbox(t *testing.T) {
+	tests := []struct {
+		name    string
+		address string
+		primary string
+		domains []string
+		want    bool
+	}{
+		{name: "primary exact mailbox", address: "sender@example.com", primary: "sender@example.com", want: true},
+		{name: "primary local part remains case sensitive", address: "Sender@example.com", primary: "sender@example.com", want: false},
+		{name: "verified domain", address: "billing@verified.example.org", primary: "sender@example.com", domains: []string{"verified.example.org"}, want: true},
+		{name: "verified domain is case insensitive", address: "billing@VERIFIED.example.org", primary: "sender@example.com", domains: []string{"verified.example.org"}, want: true},
+		{name: "unverified domain", address: "billing@unverified.example.org", primary: "sender@example.com", domains: []string{"verified.example.org"}, want: false},
+		{name: "invalid mailbox", address: "not-an-email", primary: "sender@example.com", domains: []string{"verified.example.org"}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsAuthorizedMailbox(test.address, test.primary, test.domains); got != test.want {
+				t.Fatalf("IsAuthorizedMailbox(%q) = %v, want %v", test.address, got, test.want)
+			}
+		})
+	}
+}

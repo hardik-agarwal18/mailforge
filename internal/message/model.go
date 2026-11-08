@@ -8,9 +8,10 @@ import (
 
 type NewMessage struct {
 	Sender string
-	// AuthenticatedEmail is set only for authenticated SMTP submission. When set,
-	// the visible RFC 5322 From (and optional Sender) headers must match it.
+	// AuthenticatedEmail is set only for authenticated SMTP submission.
+	// AuthorizedDomains contains DNS-verified sending domains for this credential.
 	AuthenticatedEmail string
+	AuthorizedDomains  []string
 	ClientIP           string
 	Recipients         []string
 	RawMessage         []byte

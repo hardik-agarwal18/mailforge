@@ -76,16 +76,17 @@ func (r *Repository) Authenticate(
 	}
 
 	var (
+		credentialID string
 		email        string
 		passwordHash string
 		enabled      bool
 	)
 
 	err := r.db.QueryRow(ctx, `
-		SELECT email_address, password_hash, enabled
+		SELECT id::text, email_address, password_hash, enabled
 		FROM smtp_credentials
 		WHERE username = $1
-	`, username).Scan(&email, &passwordHash, &enabled)
+	`, username).Scan(&credentialID, &email, &passwordHash, &enabled)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Spend a password-hash verification on unknown users as well, reducing
 		// the username-enumeration timing difference.
@@ -108,8 +109,32 @@ func (r *Repository) Authenticate(
 		return smtp.Identity{}, fmt.Errorf("update SMTP credential activity: %w", err)
 	}
 
+	rows, err := r.db.Query(ctx, `
+		SELECT domain
+		FROM smtp_sending_domains
+		WHERE smtp_credential_id = $1::text::uuid AND verified_at IS NOT NULL
+		ORDER BY domain
+	`, credentialID)
+	if err != nil {
+		return smtp.Identity{}, fmt.Errorf("load verified sending domains: %w", err)
+	}
+	defer rows.Close()
+
+	var authorizedDomains []string
+	for rows.Next() {
+		var domain string
+		if err := rows.Scan(&domain); err != nil {
+			return smtp.Identity{}, fmt.Errorf("scan verified sending domain: %w", err)
+		}
+		authorizedDomains = append(authorizedDomains, domain)
+	}
+	if err := rows.Err(); err != nil {
+		return smtp.Identity{}, fmt.Errorf("iterate verified sending domains: %w", err)
+	}
+
 	return smtp.Identity{
-		Username: username,
-		Email:    email,
+		Username:          username,
+		Email:             email,
+		AuthorizedDomains: authorizedDomains,
 	}, nil
 }

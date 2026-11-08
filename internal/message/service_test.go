@@ -210,7 +210,7 @@ func TestAcceptEnforcesAuthenticatedSubmissionIdentity(t *testing.T) {
 		name         string
 		envelopeFrom string
 		message      string
-		wantError    bool
+		wantErr      error
 	}{
 		{
 			name:         "matching From",
@@ -221,31 +221,37 @@ func TestAcceptEnforcesAuthenticatedSubmissionIdentity(t *testing.T) {
 			name:         "missing From",
 			envelopeFrom: "sender@example.com",
 			message:      "Subject: no visible author\r\n\r\nhello\r\n",
-			wantError:    true,
+			wantErr:      ErrUnauthorizedSubmissionIdentity,
 		},
 		{
 			name:         "spoofed From",
 			envelopeFrom: "sender@example.com",
 			message:      "From: ceo@another-company.com\r\n\r\nhello\r\n",
-			wantError:    true,
+			wantErr:      ErrUnauthorizedSubmissionIdentity,
 		},
 		{
 			name:         "multiple From mailboxes",
 			envelopeFrom: "sender@example.com",
 			message:      "From: sender@example.com, attacker@example.net\r\nSender: sender@example.com\r\n\r\nhello\r\n",
-			wantError:    true,
+			wantErr:      ErrUnauthorizedSubmissionIdentity,
 		},
 		{
 			name:         "spoofed Sender header",
 			envelopeFrom: "sender@example.com",
 			message:      "From: sender@example.com\r\nSender: attacker@example.net\r\n\r\nhello\r\n",
-			wantError:    true,
+			wantErr:      ErrUnauthorizedSubmissionIdentity,
+		},
+		{
+			name:         "multiple Sender mailboxes",
+			envelopeFrom: "sender@example.com",
+			message:      "From: sender@example.com\r\nSender: sender@example.com, attacker@example.net\r\n\r\nhello\r\n",
+			wantErr:      ErrInvalidMessageFormat,
 		},
 		{
 			name:         "spoofed envelope sender",
 			envelopeFrom: "attacker@example.net",
 			message:      "From: sender@example.com\r\n\r\nhello\r\n",
-			wantError:    true,
+			wantErr:      ErrUnauthorizedSubmissionIdentity,
 		},
 	}
 
@@ -260,12 +266,12 @@ func TestAcceptEnforcesAuthenticatedSubmissionIdentity(t *testing.T) {
 				RawMessage:         []byte(test.message),
 			})
 
-			if test.wantError {
-				if !errors.Is(err, ErrUnauthorizedSubmissionIdentity) {
-					t.Fatalf("Accept() error = %v, want ErrUnauthorizedSubmissionIdentity", err)
+			if test.wantErr != nil {
+				if !errors.Is(err, test.wantErr) {
+					t.Fatalf("Accept() error = %v, want %v", err, test.wantErr)
 				}
 				if creator.calls != 0 {
-					t.Fatalf("repository Create called %d times for unauthorized submission", creator.calls)
+					t.Fatalf("repository Create called %d times for rejected submission", creator.calls)
 				}
 				return
 			}
@@ -277,5 +283,42 @@ func TestAcceptEnforcesAuthenticatedSubmissionIdentity(t *testing.T) {
 				t.Fatalf("repository Create calls = %d, want 1", creator.calls)
 			}
 		})
+	}
+}
+
+func TestAcceptAllowsVerifiedSendingDomain(t *testing.T) {
+	creator := &recordingCreator{}
+	service := NewService(creator)
+	_, err := service.Accept(context.Background(), NewMessage{
+		Sender:             "billing@verified.example.org",
+		AuthenticatedEmail: "sender@example.com",
+		AuthorizedDomains:  []string{"verified.example.org"},
+		Recipients:         []string{"recipient@example.net"},
+		RawMessage: []byte("From: Billing <billing@VERIFIED.example.org>\r\n" +
+			"Sender: billing@verified.example.org\r\n" +
+			"To: recipient@example.net\r\n\r\nhello\r\n"),
+	})
+	if err != nil {
+		t.Fatalf("Accept() rejected verified-domain sender: %v", err)
+	}
+	if creator.calls != 1 {
+		t.Fatalf("repository Create calls = %d, want 1", creator.calls)
+	}
+}
+
+func TestAcceptRejectsUnverifiedDomainEvenWhenPrimaryDomainMatches(t *testing.T) {
+	creator := &recordingCreator{}
+	service := NewService(creator)
+	_, err := service.Accept(context.Background(), NewMessage{
+		Sender:             "alias@example.com",
+		AuthenticatedEmail: "sender@example.com",
+		Recipients:         []string{"recipient@example.net"},
+		RawMessage:         []byte("From: alias@example.com\r\n\r\nhello\r\n"),
+	})
+	if !errors.Is(err, ErrUnauthorizedSubmissionIdentity) {
+		t.Fatalf("Accept() error = %v, want ErrUnauthorizedSubmissionIdentity", err)
+	}
+	if creator.calls != 0 {
+		t.Fatalf("repository Create called %d times for unverified alias", creator.calls)
 	}
 }

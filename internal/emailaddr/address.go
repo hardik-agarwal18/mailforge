@@ -225,3 +225,22 @@ func isASCII(value string) bool {
 	}
 	return true
 }
+
+// IsAuthorizedMailbox reports whether address is the primary authenticated
+// mailbox or belongs to one of the explicitly authorized (DNS-verified) domains.
+// Local-parts remain case-sensitive; domain comparison is case-insensitive.
+func IsAuthorizedMailbox(address, primaryEmail string, authorizedDomains []string) bool {
+	if Equal(address, primaryEmail) {
+		return true
+	}
+	mailbox, err := ParseMailbox(address)
+	if err != nil {
+		return false
+	}
+	for _, domain := range authorizedDomains {
+		if strings.EqualFold(mailbox.Domain, domain) {
+			return true
+		}
+	}
+	return false
+}

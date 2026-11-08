@@ -20,6 +20,7 @@ type Session struct {
 	Authenticated         bool
 	AuthenticatedUsername string
 	AuthenticatedEmail    string
+	AuthorizedDomains     []string
 	AuthFailures          int
 
 	Sender      string

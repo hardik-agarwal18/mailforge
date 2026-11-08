@@ -27,9 +27,10 @@ const (
 )
 
 var (
-	errAuthCancelled            = errors.New("SMTP authentication cancelled")
-	errAuthProtocol             = errors.New("invalid SMTP authentication exchange")
-	errUnsupportedAuthMechanism = errors.New("unsupported SMTP AUTH mechanism")
+	errAuthCancelled                      = errors.New("SMTP authentication cancelled")
+	errAuthProtocol                       = errors.New("invalid SMTP authentication exchange")
+	errUnsupportedAuthMechanism           = errors.New("unsupported SMTP AUTH mechanism")
+	errUnauthenticatedListenerMustBeLocal = errors.New("unauthenticated SMTP listener must bind to a loopback IP")
 )
 
 type Server struct {
@@ -47,6 +48,10 @@ type Server struct {
 	rateLimiter     *fixedWindowLimiter
 }
 
+// NewServer creates an unauthenticated SMTP listener for trusted local message
+// injection only. StartContext refuses to bind this listener to a non-loopback
+// address. Public message submission must use NewSubmissionServer so TLS,
+// SMTP AUTH, and sender-domain authorization are enforced.
 func NewServer(
 	address string,
 	messageAcceptor MessageAcceptor,
@@ -126,6 +131,12 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) StartContext(ctx context.Context) error {
+	if !s.submission {
+		if err := validateUnauthenticatedListenAddress(s.Address); err != nil {
+			return fmt.Errorf("refusing to start unauthenticated SMTP listener: %w", err)
+		}
+	}
+
 	listener, err := net.Listen("tcp", s.Address)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
@@ -276,6 +287,7 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 			session.Authenticated = false
 			session.AuthenticatedUsername = ""
 			session.AuthenticatedEmail = ""
+			session.AuthorizedDomains = nil
 
 		case "AUTH":
 			if !s.submission {
@@ -363,6 +375,7 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 			session.Authenticated = true
 			session.AuthenticatedUsername = identity.Username
 			session.AuthenticatedEmail = identity.Email
+			session.AuthorizedDomains = append([]string(nil), identity.AuthorizedDomains...)
 			_ = writeReply(conn, "235 2.7.0 Authentication successful")
 
 		case "MAIL":
@@ -386,7 +399,7 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 				_ = writeReply(conn, "553 5.1.7 Invalid sender address")
 				continue
 			}
-			if s.submission && (address == "" || !emailaddr.Equal(address, session.AuthenticatedEmail)) {
+			if s.submission && !emailaddr.IsAuthorizedMailbox(address, session.AuthenticatedEmail, session.AuthorizedDomains) {
 				_ = writeReply(conn, "553 5.7.1 Sender address is not authorized for this account")
 				continue
 			}
@@ -455,8 +468,10 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 				clientIP = remoteIP(conn)
 			}
 			authenticatedEmail := ""
+			var authorizedDomains []string
 			if s.submission {
 				authenticatedEmail = session.AuthenticatedEmail
+				authorizedDomains = append([]string(nil), session.AuthorizedDomains...)
 			}
 			acceptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			stored, err := s.messageAcceptor.Accept(
@@ -464,6 +479,7 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 				message.NewMessage{
 					Sender:             session.Sender,
 					AuthenticatedEmail: authenticatedEmail,
+					AuthorizedDomains:  authorizedDomains,
 					ClientIP:           clientIP,
 					Recipients:         session.Recipients,
 					RawMessage:         session.MessageData,
@@ -533,6 +549,21 @@ func (s *Server) ehloCapabilities(session *Session) []string {
 	}
 	lines = append(lines, "250 HELP")
 	return lines
+}
+
+// validateUnauthenticatedListenAddress ensures the legacy unauthenticated
+// listener cannot accidentally become a public relay. Requiring a literal
+// loopback IP avoids ambiguous hostname resolution and wildcard binds.
+func validateUnauthenticatedListenAddress(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid SMTP listen address %q: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("%w: %q (use 127.0.0.1 or [::1])", errUnauthenticatedListenerMustBeLocal, address)
+	}
+	return nil
 }
 
 func remoteIP(conn net.Conn) string {

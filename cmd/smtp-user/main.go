@@ -18,7 +18,7 @@ import (
 
 func main() {
 	username := flag.String("username", "", "SMTP AUTH username")
-	email := flag.String("email", "", "Allowed envelope sender email address")
+	email := flag.String("email", "", "Primary authorized sender mailbox")
 	flag.Parse()
 
 	if *username == "" || *email == "" {

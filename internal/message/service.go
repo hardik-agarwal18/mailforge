@@ -80,12 +80,12 @@ func (s *Service) Accept(
 		return StoredMessage{}, fmt.Errorf("%w: %v", ErrInvalidMessageFormat, err)
 	}
 
-	// Authenticated submission must not allow the message's visible author to
-	// differ from the identity that authenticated to SMTP. The ordinary inbound
-	// SMTP listener leaves AuthenticatedEmail empty and is intentionally exempt:
-	// inbound sender authenticity is evaluated through mail-authentication policy.
+	// Authenticated submission must use the credential's primary mailbox or a
+	// DNS-verified sending domain for the envelope and visible author fields.
+	// Ordinary inbound SMTP leaves AuthenticatedEmail empty and is intentionally
+	// exempt because remote sender authenticity is a separate mail-auth concern.
 	if input.AuthenticatedEmail != "" {
-		if err := validateAuthenticatedSubmissionIdentity(input.AuthenticatedEmail, input.Sender, parsed); err != nil {
+		if err := validateAuthenticatedSubmissionIdentity(input.AuthenticatedEmail, input.AuthorizedDomains, input.Sender, parsed); err != nil {
 			return StoredMessage{}, err
 		}
 	}
@@ -117,18 +117,21 @@ func (s *Service) Accept(
 // validateAuthenticatedSubmissionIdentity enforces the single-mailbox identity model
 // currently returned by the SMTP authenticator. Supporting aliases should extend
 // the authenticated identity with an explicit allow-list, not weaken this check.
-func validateAuthenticatedSubmissionIdentity(authenticatedEmail, envelopeSender string, parsed *mimeparser.ParsedMessage) error {
+func validateAuthenticatedSubmissionIdentity(authenticatedEmail string, authorizedDomains []string, envelopeSender string, parsed *mimeparser.ParsedMessage) error {
 	if err := emailaddr.ValidateMailbox(authenticatedEmail); err != nil {
 		return fmt.Errorf("%w: invalid authenticated identity", ErrUnauthorizedSubmissionIdentity)
 	}
-	if !emailaddr.Equal(envelopeSender, authenticatedEmail) {
-		return fmt.Errorf("%w: envelope sender must match the authenticated mailbox", ErrUnauthorizedSubmissionIdentity)
+	if !emailaddr.IsAuthorizedMailbox(envelopeSender, authenticatedEmail, authorizedDomains) {
+		return fmt.Errorf("%w: envelope sender is not an authorized mailbox", ErrUnauthorizedSubmissionIdentity)
 	}
-	if len(parsed.From) != 1 || !emailaddr.Equal(parsed.From[0].Address, authenticatedEmail) {
-		return fmt.Errorf("%w: From must contain exactly the authenticated mailbox", ErrUnauthorizedSubmissionIdentity)
+	if len(parsed.From) != 1 || !emailaddr.IsAuthorizedMailbox(parsed.From[0].Address, authenticatedEmail, authorizedDomains) {
+		return fmt.Errorf("%w: From must contain exactly one authorized mailbox", ErrUnauthorizedSubmissionIdentity)
 	}
-	if len(parsed.Sender) > 0 && !emailaddr.Equal(parsed.Sender[0].Address, authenticatedEmail) {
-		return fmt.Errorf("%w: Sender must match the authenticated mailbox", ErrUnauthorizedSubmissionIdentity)
+	if len(parsed.Sender) > 1 {
+		return fmt.Errorf("%w: Sender must contain at most one mailbox", ErrUnauthorizedSubmissionIdentity)
+	}
+	if len(parsed.Sender) == 1 && !emailaddr.IsAuthorizedMailbox(parsed.Sender[0].Address, authenticatedEmail, authorizedDomains) {
+		return fmt.Errorf("%w: Sender must be an authorized mailbox", ErrUnauthorizedSubmissionIdentity)
 	}
 	return nil
 }

@@ -267,7 +267,7 @@
       "id": 5,
       "type": "timeseries",
       "title": "SMTP message acceptance rate",
-      "description": "Compares the inbound SMTP listener (port 2525) with authenticated submission (port 587).",
+      "description": "Compares the trusted local SMTP injection listener (loopback port 2525) with authenticated submission (port 587).",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

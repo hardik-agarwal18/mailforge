@@ -39,7 +39,11 @@ func (testAuthenticator) Authenticate(_ context.Context, username, password stri
 	if username != "hardik" || password != "test-password" {
 		return Identity{}, ErrInvalidCredentials
 	}
-	return Identity{Username: "hardik", Email: "sender@example.com"}, nil
+	return Identity{
+		Username:          "hardik",
+		Email:             "sender@example.com",
+		AuthorizedDomains: []string{"verified.example.org"},
+	}, nil
 }
 
 type testMetrics struct {
@@ -206,6 +210,14 @@ func TestSubmissionRequiresTLSAndAuthenticationAndBindsSender(t *testing.T) {
 
 	writeCommand(t, tlsClient, "MAIL FROM:<attacker@example.com>")
 	assertCode(t, readReply(t, reader), "553")
+	writeCommand(t, tlsClient, "MAIL FROM:<attacker@unverified.example.org>")
+	assertCode(t, readReply(t, reader), "553")
+
+	// A DNS-verified sending domain permits alternate mailbox local-parts.
+	writeCommand(t, tlsClient, "MAIL FROM:<billing@verified.example.org>")
+	assertCode(t, readReply(t, reader), "250")
+	writeCommand(t, tlsClient, "RSET")
+	assertCode(t, readReply(t, reader), "250")
 
 	// Domain names are case-insensitive, but SMTP local-parts are not.
 	writeCommand(t, tlsClient, "MAIL FROM:<sender@EXAMPLE.COM>")
@@ -256,6 +268,9 @@ func TestSubmissionRequiresTLSAndAuthenticationAndBindsSender(t *testing.T) {
 	if acceptor.input.AuthenticatedEmail != "sender@example.com" {
 		t.Fatalf("authenticated submission identity = %q, want sender@example.com", acceptor.input.AuthenticatedEmail)
 	}
+	if len(acceptor.input.AuthorizedDomains) != 1 || acceptor.input.AuthorizedDomains[0] != "verified.example.org" {
+		t.Fatalf("authorized domains = %v, want [verified.example.org]", acceptor.input.AuthorizedDomains)
+	}
 	if len(acceptor.input.Recipients) != 1 || acceptor.input.Recipients[0] != "recipient@example.net" {
 		t.Fatalf("stored recipients = %v", acceptor.input.Recipients)
 	}
@@ -267,6 +282,43 @@ func TestSubmissionRequiresTLSAndAuthenticationAndBindsSender(t *testing.T) {
 	}
 	if metrics.submissions != 1 || len(metrics.accepted) != 1 || !metrics.accepted[0] {
 		t.Fatalf("submission metrics = %+v", metrics)
+	}
+}
+
+func TestUnauthenticatedListenerMustBindToLoopback(t *testing.T) {
+	tests := []struct {
+		name    string
+		address string
+		wantErr bool
+	}{
+		{name: "IPv4 loopback", address: "127.0.0.1:2525"},
+		{name: "IPv6 loopback", address: "[::1]:2525"},
+		{name: "ephemeral IPv4 loopback", address: "127.0.0.1:0"},
+		{name: "all interfaces", address: ":2525", wantErr: true},
+		{name: "IPv4 wildcard", address: "0.0.0.0:2525", wantErr: true},
+		{name: "IPv6 wildcard", address: "[::]:2525", wantErr: true},
+		{name: "public IP", address: "192.0.2.10:2525", wantErr: true},
+		{name: "hostname", address: "localhost:2525", wantErr: true},
+		{name: "missing port", address: "127.0.0.1", wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateUnauthenticatedListenAddress(test.address)
+			if test.wantErr && err == nil {
+				t.Fatalf("validateUnauthenticatedListenAddress(%q) unexpectedly succeeded", test.address)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("validateUnauthenticatedListenAddress(%q) error = %v", test.address, err)
+			}
+		})
+	}
+}
+
+func TestStartContextRefusesPublicUnauthenticatedListener(t *testing.T) {
+	server := NewServer("0.0.0.0:0", &testAcceptor{}, nil)
+	if err := server.StartContext(context.Background()); err == nil {
+		t.Fatal("StartContext() unexpectedly started an unauthenticated public listener")
 	}
 }
 
