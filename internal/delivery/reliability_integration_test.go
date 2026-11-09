@@ -74,6 +74,98 @@ func TestIntegrationSuccessfulDeliveryThroughSMTPRelay(t *testing.T) {
 	}
 }
 
+func TestIntegrationAmbiguousFinalDATAOutcomeBecomesUnknownWithoutRetry(t *testing.T) {
+	db := integrationPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	recipientID, messageID := integrationCreateRecipient(t, ctx, db)
+	mock, relay := startIntegrationMockSMTP(t, deliverybench.MockSMTPConfig{
+		DropAfterDATAEvery: 1,
+	})
+	processor := NewProcessor(NewRepository(db), relay)
+	job := DeliveryJob{
+		RecipientID: recipientID,
+		MessageID:   messageID,
+		Email:       "recipient@example.test",
+	}
+
+	// The mock consumes the complete DATA body (including the SMTP terminator),
+	// records it as accepted, then closes the connection before sending the
+	// final 250. MailForge must treat this outcome as ambiguous, not retryable.
+	if err := processor.Process(ctx, job); err != nil {
+		t.Fatalf("process ambiguous final DATA response: %v", err)
+	}
+
+	stats := mock.Stats()
+	if stats.AcceptedMessages != 1 || stats.DroppedAfterDATA != 1 || stats.AcceptedRecipients != 1 {
+		t.Fatalf("mock SMTP stats = %+v, want one accepted message/recipient and one dropped final response", stats)
+	}
+
+	var status string
+	var attempts int
+	var lastSMTPStage string
+	var lastError string
+	if err := db.QueryRow(ctx, `
+		SELECT status, attempts, last_smtp_stage, last_error
+		FROM recipients
+		WHERE id = $1::uuid
+	`, recipientID).Scan(&status, &attempts, &lastSMTPStage, &lastError); err != nil {
+		t.Fatalf("read ambiguous recipient result: %v", err)
+	}
+	if status != "unknown" || attempts != 1 || lastSMTPStage != "data_final" {
+		t.Fatalf("recipient result = %s/%d attempts/stage %q, want unknown/1/data_final", status, attempts, lastSMTPStage)
+	}
+	if strings.TrimSpace(lastError) == "" {
+		t.Fatal("unknown recipient has no diagnostic explaining the lost final DATA response")
+	}
+
+	var attemptStatus string
+	var attemptStage string
+	if err := db.QueryRow(ctx, `
+		SELECT status, smtp_stage
+		FROM delivery_attempts
+		WHERE recipient_id = $1::uuid AND attempt_number = 1
+	`, recipientID).Scan(&attemptStatus, &attemptStage); err != nil {
+		t.Fatalf("read ambiguous delivery attempt: %v", err)
+	}
+	if attemptStatus != "unknown" || attemptStage != "data_final" {
+		t.Fatalf("delivery attempt = %s/stage %q, want unknown/data_final", attemptStatus, attemptStage)
+	}
+
+	var retryEvents int
+	if err := db.QueryRow(ctx, `
+		SELECT COUNT(*)::integer
+		FROM outbox_events
+		WHERE aggregate_id = $1::uuid
+		  AND event_type = 'recipient.delivery_requested'
+	`, recipientID).Scan(&retryEvents); err != nil {
+		t.Fatalf("count retry outbox events: %v", err)
+	}
+	if retryEvents != 0 {
+		t.Fatalf("retry outbox events = %d, want 0 for ambiguous delivery", retryEvents)
+	}
+
+	// Replaying the original event must be a no-op because unknown is a
+	// terminal automatic-delivery state pending explicit operator review.
+	if err := processor.Process(ctx, job); err != nil {
+		t.Fatalf("replay event for unknown recipient: %v", err)
+	}
+	if got := mock.Stats().AcceptedMessages; got != 1 {
+		t.Fatalf("remote accepted message count after replay = %d, want 1", got)
+	}
+	var finalStatus string
+	var finalAttempts int
+	if err := db.QueryRow(ctx, `
+		SELECT status, attempts FROM recipients WHERE id = $1::uuid
+	`, recipientID).Scan(&finalStatus, &finalAttempts); err != nil {
+		t.Fatalf("read final ambiguous recipient state: %v", err)
+	}
+	if finalStatus != "unknown" || finalAttempts != 1 {
+		t.Fatalf("final recipient state = %s/%d attempts, want unknown/1", finalStatus, finalAttempts)
+	}
+}
+
 func TestIntegrationTemporarySMTPFailureRetriesAndEventuallyDelivers(t *testing.T) {
 	db := integrationPostgres(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -424,6 +516,122 @@ func TestIntegrationExpiredInFlightLeaseBecomesUnknownAfterOutcomeWriteFailure(t
 	}
 	if status != "unknown" || attemptStatus != "unknown" || eventType != "lease_expired_ambiguous" {
 		t.Fatalf("reconciled state = %s/%s/%s, want unknown/unknown/lease_expired_ambiguous", status, attemptStatus, eventType)
+	}
+}
+
+func TestIntegrationExpiredLeaseDuringActiveSMTPPreventsStaleWorkerCommit(t *testing.T) {
+	db := integrationPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	recipientID, messageID := integrationCreateRecipient(t, ctx, db)
+	sender := &integrationSender{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	processor := NewProcessor(NewRepository(db), sender)
+	job := DeliveryJob{
+		RecipientID: recipientID,
+		MessageID:   messageID,
+		Email:       "recipient@example.test",
+	}
+
+	// Worker A claims the PostgreSQL lease and remains inside the SMTP send.
+	// The sender is deliberately held open while the lease is expired below.
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- processor.Process(ctx, job)
+	}()
+
+	select {
+	case <-sender.started:
+	case <-ctx.Done():
+		t.Fatal("first worker did not enter SMTP send")
+	}
+
+	var leaseToken string
+	var status string
+	var attempts int
+	if err := db.QueryRow(ctx, `
+		SELECT status, attempts, delivery_lease_token::text
+		FROM recipients WHERE id = $1::uuid
+	`, recipientID).Scan(&status, &attempts, &leaseToken); err != nil {
+		t.Fatalf("read active delivery lease: %v", err)
+	}
+	if status != "delivering" || attempts != 1 || strings.TrimSpace(leaseToken) == "" {
+		t.Fatalf("active delivery state = %s/%d attempts/token %q, want delivering/1/non-empty token", status, attempts, leaseToken)
+	}
+
+	// Simulate a lease that expires while Worker A is still doing SMTP I/O.
+	// A duplicate event arriving now must reconcile the outcome to unknown,
+	// not grant ownership to Worker B and start a second SMTP send.
+	tag, err := db.Exec(ctx, `
+		UPDATE recipients
+		SET delivery_lease_until = NOW() - INTERVAL '1 second'
+		WHERE id = $1::uuid
+		  AND status = 'delivering'
+		  AND delivery_lease_token = $2::uuid
+	`, recipientID, leaseToken)
+	if err != nil {
+		t.Fatalf("expire active delivery lease: %v", err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("expired lease update affected %d rows, want 1", tag.RowsAffected())
+	}
+
+	if err := processor.Process(ctx, job); err != nil {
+		t.Fatalf("process duplicate event after active lease expiry: %v", err)
+	}
+	if got := sender.calls.Load(); got != 1 {
+		t.Fatalf("SMTP sends while original worker is still active = %d, want 1", got)
+	}
+
+	var reconciledStatus string
+	var clearedLeaseToken string
+	if err := db.QueryRow(ctx, `
+		SELECT status, COALESCE(delivery_lease_token::text, '')
+		FROM recipients WHERE id = $1::uuid
+	`, recipientID).Scan(&reconciledStatus, &clearedLeaseToken); err != nil {
+		t.Fatalf("read state after expired lease reconciliation: %v", err)
+	}
+	if reconciledStatus != "unknown" || clearedLeaseToken != "" {
+		t.Fatalf("state after lease reconciliation = %s/token %q, want unknown/empty", reconciledStatus, clearedLeaseToken)
+	}
+
+	// Worker A now returns a success result after losing ownership. Its stale
+	// lease token and terminal recipient state must prevent that result from
+	// overwriting the reconciled unknown state.
+	close(sender.release)
+	select {
+	case err := <-firstDone:
+		if err == nil {
+			t.Fatal("stale worker unexpectedly committed success after losing its lease")
+		}
+	case <-ctx.Done():
+		t.Fatal("stale worker did not finish after SMTP sender was released")
+	}
+
+	var finalStatus string
+	var finalAttempts int
+	var unknownAttempts int
+	var deliveredAttempts int
+	if err := db.QueryRow(ctx, `
+		SELECT status, attempts,
+		       (SELECT COUNT(*)::integer FROM delivery_attempts a WHERE a.recipient_id = r.id AND a.status = 'unknown'),
+		       (SELECT COUNT(*)::integer FROM delivery_attempts a WHERE a.recipient_id = r.id AND a.status = 'success')
+		FROM recipients r
+		WHERE r.id = $1::uuid
+	`, recipientID).Scan(&finalStatus, &finalAttempts, &unknownAttempts, &deliveredAttempts); err != nil {
+		t.Fatalf("read final recipient state after stale worker completion: %v", err)
+	}
+	if finalStatus != "unknown" || finalAttempts != 1 || unknownAttempts != 1 || deliveredAttempts != 0 {
+		t.Fatalf(
+			"final state = %s/%d attempts/unknown attempts %d/delivered attempts %d, want unknown/1/1/0",
+			finalStatus, finalAttempts, unknownAttempts, deliveredAttempts,
+		)
+	}
+	if got := sender.calls.Load(); got != 1 {
+		t.Fatalf("total SMTP sends = %d, want exactly 1", got)
 	}
 }
 
