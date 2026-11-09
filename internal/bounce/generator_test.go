@@ -40,7 +40,21 @@ func TestGeneratorRejectsTamperingAndWrongDomain(t *testing.T) {
 		t.Fatal(err)
 	}
 	local, domain, _ := strings.Cut(address, "@")
-	mutated := local[:len(local)-1] + "A@" + domain
+	// Change the first signature character, guaranteeing the token changes.
+	// Mutating the final base64url character is not reliable: for a 16-byte
+	// tag, only two bits are significant in that character, and replacing it
+	// with 'A' can leave an existing 'A' unchanged.
+	identity, signature, ok := strings.Cut(strings.TrimPrefix(local, "b+"), ".")
+	if !ok || identity == "" || signature == "" {
+		t.Fatalf("generated VERP local-part has unexpected format: %q", local)
+	}
+	sig := []byte(signature)
+	if sig[0] == 'A' {
+		sig[0] = 'B'
+	} else {
+		sig[0] = 'A'
+	}
+	mutated := "b+" + identity + "." + string(sig) + "@" + domain
 	if _, err := g.RecipientID(mutated); err == nil {
 		t.Fatal("tampered token accepted")
 	}
