@@ -12,6 +12,7 @@ This guide describes local operation and the minimum operator checks for MailFor
 | Delivery worker | `go run ./cmd/delivery-worker` | Consume delivery jobs and perform outbound SMTP |
 | Bounce receiver | `go run ./cmd/smtp-bounce` | Receive and process DSNs using VERP/HMAC |
 | Delivery report | `go run ./cmd/delivery-status <id>` | Read-only recipient and event report |
+| Unknown-delivery reconciliation | `go run ./cmd/delivery-reconcile --help` | Audited accepted/retry decision for `unknown` recipients |
 | Outbox administration | `go run ./cmd/outbox-admin` | Inspect/replay dead outbox events (see command usage) |
 
 Run long-lived application commands in separate processes/terminals. Each process needs the appropriate environment variables and database/Redis access.
@@ -107,6 +108,7 @@ Alertmanager routes local alert email to Mailpit in the sample configuration. In
 3. Allow the configured pending-entry idle threshold and lease expiry/recovery mechanism to reclaim eligible work.
 4. Query the recipient using `cmd/delivery-status`.
 5. If the recipient is `unknown`, investigate the remote SMTP transaction before any manual replay. It may have been accepted remotely.
+6. Only after evidence is available, use `cmd/delivery-reconcile` with an operator identity, reason, and evidence reference. See [Delivery reconciliation](delivery-reconciliation.md). Do not update recipient rows manually.
 
 ### Outbox events are dead-lettered
 
@@ -127,3 +129,5 @@ Check SMTP response code, enhanced status code, failure stage, last error, and `
 - Do not run `docker compose down -v` unless local data loss is intended.
 - Back up PostgreSQL before schema changes and test restore procedures.
 - Alerting and metrics are not substitutes for structured logs, backups, and an incident process.
+- Metrics listeners default to loopback. Override their addresses only on a protected monitoring network.
+- The DSN receiver defaults to loopback. A non-loopback bind requires trusted peer CIDRs plus mutual TLS; see [Security](security.md#bounce-security).

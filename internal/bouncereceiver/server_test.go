@@ -3,6 +3,8 @@ package bouncereceiver
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"strings"
@@ -287,4 +289,116 @@ func TestReceiverProcessesRFC3464DSNBeforeAcknowledging(t *testing.T) {
 	if !processed.Load() {
 		t.Fatal("DSN processor was not called")
 	}
+}
+
+func TestNewRequiresTrustedCIDRsForNonLoopbackListener(t *testing.T) {
+	generator, err := bounce.NewGenerator("bounces.example.test", []byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(Config{Address: "0.0.0.0:2526"}, generator, &recordingProcessor{}); err == nil {
+		t.Fatal("New() accepted a non-loopback listener without trusted peer CIDRs")
+	}
+	if _, err := New(Config{Address: "0.0.0.0:2526", TrustedPeerCIDRs: []string{"not-a-cidr"}}, generator, &recordingProcessor{}); err == nil {
+		t.Fatal("New() accepted an invalid trusted peer CIDR")
+	}
+	if _, err := New(Config{Address: "0.0.0.0:2526", TrustedPeerCIDRs: []string{"192.0.2.10/32"}}, generator, &recordingProcessor{}); err == nil {
+		t.Fatal("New() accepted non-loopback listener without mutual TLS")
+	}
+	mtls := &tls.Config{ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: x509.NewCertPool()}
+	if _, err := New(Config{Address: "0.0.0.0:2526", TrustedPeerCIDRs: []string{"192.0.2.10/32"}, TLSConfig: mtls}, generator, &recordingProcessor{}); err != nil {
+		t.Fatalf("New() rejected trusted peer allowlist with mutual TLS: %v", err)
+	}
+	if _, err := New(Config{Address: "0.0.0.0:2526", TrustedPeerCIDRs: []string{"0.0.0.0/0"}, TLSConfig: mtls}, generator, &recordingProcessor{}); err == nil {
+		t.Fatal("New() accepted an unrestricted /0 trusted peer range")
+	}
+}
+
+func TestReceiverPeerAllowlistAndPerPeerRateLimit(t *testing.T) {
+	generator, err := bounce.NewGenerator("bounces.example.test", []byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Config{MaxDSNsPerPeerPerMinute: 1}, generator, &recordingProcessor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !server.isTrustedPeer(net.ParseIP("127.0.0.1")) {
+		t.Fatal("loopback peer should be trusted by default")
+	}
+	if server.isTrustedPeer(net.ParseIP("192.0.2.10")) {
+		t.Fatal("non-loopback peer should not be trusted without an allowlist")
+	}
+	now := time.Date(2026, time.November, 9, 12, 0, 0, 0, time.UTC)
+	if !server.allowDSN("127.0.0.1", now) {
+		t.Fatal("first DSN should pass the per-peer rate limit")
+	}
+	if server.allowDSN("127.0.0.1", now.Add(10*time.Second)) {
+		t.Fatal("second DSN in the same window should be rate limited")
+	}
+	if !server.allowDSN("127.0.0.1", now.Add(time.Minute)) {
+		t.Fatal("DSN should be accepted after the rate window resets")
+	}
+}
+
+func TestServeCannotBypassExternalListenerTrustValidation(t *testing.T) {
+	generator, err := bounce.NewGenerator("bounces.example.test", []byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Config{}, generator, &recordingProcessor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Skipf("cannot bind wildcard test listener: %v", err)
+	}
+	defer listener.Close()
+	if err := server.Serve(context.Background(), listener); err == nil || !strings.Contains(err.Error(), "TrustedPeerCIDRs") {
+		t.Fatalf("Serve() error = %v, want external-listener trust error", err)
+	}
+}
+
+func TestReceiverRequiresSTARTTLSBeforeMAILWhenMutualTLSIsConfigured(t *testing.T) {
+	generator, err := bounce.NewGenerator("bounces.example.test", []byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Config{
+		TLSConfig: &tls.Config{
+			ClientAuth: tls.RequireAndVerifyClientCert,
+			ClientCAs:  x509.NewCertPool(),
+		},
+	}, generator, &recordingProcessor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_ = server.Serve(ctx, listener)
+	}()
+	conn, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+	if err != nil {
+		cancel()
+		<-serveDone
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = conn.Close()
+		cancel()
+		<-serveDone
+	}()
+	reader := bufio.NewReader(conn)
+	if got := readReply(t, reader); !strings.HasPrefix(got, "220 ") {
+		t.Fatalf("greeting = %q", got)
+	}
+	sendCommand(t, conn, reader, "EHLO local.example", "250-")
+	sendCommand(t, conn, reader, "MAIL FROM:<>", "530 ")
 }

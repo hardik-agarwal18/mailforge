@@ -66,6 +66,12 @@ type Config struct {
 	DataTimeout    time.Duration
 	ProcessTimeout time.Duration
 	TLSConfig      *tls.Config
+	// TrustedPeerCIDRs limits the listener to a trusted front MTA or private
+	// network. When omitted, only loopback peers are accepted.
+	TrustedPeerCIDRs []string
+	// MaxDSNsPerPeerPerMinute bounds DSN processing from one source IP.
+	// Defaults to 300; set explicitly for the expected MTA delivery volume.
+	MaxDSNsPerPeerPerMinute int
 }
 
 type Server struct {
@@ -73,9 +79,14 @@ type Server struct {
 	generator *bounce.Generator
 	processor Processor
 
-	mu       sync.Mutex
-	conns    map[net.Conn]struct{}
-	capacity chan struct{}
+	mu         sync.Mutex
+	conns      map[net.Conn]struct{}
+	capacity   chan struct{}
+	trustedIPs []*net.IPNet
+	rateMu     sync.Mutex
+	peerRates  map[string]peerRate
+	maxDSNRate int
+	requireTLS bool
 }
 
 func New(config Config, generator *bounce.Generator, processor Processor) (*Server, error) {
@@ -97,6 +108,36 @@ func New(config Config, generator *bounce.Generator, processor Processor) (*Serv
 	if config.MaxConnections <= 0 {
 		config.MaxConnections = defaultMaxConnections
 	}
+	if config.MaxDSNsPerPeerPerMinute <= 0 {
+		config.MaxDSNsPerPeerPerMinute = 300
+	}
+	trustedIPs := make([]*net.IPNet, 0, len(config.TrustedPeerCIDRs))
+	for _, rawCIDR := range config.TrustedPeerCIDRs {
+		rawCIDR = strings.TrimSpace(rawCIDR)
+		if rawCIDR == "" {
+			continue
+		}
+		if ip := net.ParseIP(rawCIDR); ip != nil {
+			maskBits := 128
+			if ip.To4() != nil {
+				ip = ip.To4()
+				maskBits = 32
+			}
+			trustedIPs = append(trustedIPs, &net.IPNet{IP: ip, Mask: net.CIDRMask(maskBits, maskBits)})
+			continue
+		}
+		_, network, parseErr := net.ParseCIDR(rawCIDR)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid trusted DSN peer CIDR %q: %w", rawCIDR, parseErr)
+		}
+		if prefix, _ := network.Mask.Size(); prefix == 0 {
+			return nil, fmt.Errorf("trusted DSN peer CIDR %q is too broad; /0 is not allowed", rawCIDR)
+		}
+		trustedIPs = append(trustedIPs, network)
+	}
+	if err := validateListenerTrust(config.Address, trustedIPs, config.TLSConfig); err != nil {
+		return nil, err
+	}
 	if config.CommandTimeout <= 0 {
 		config.CommandTimeout = defaultCommandTimeout
 	}
@@ -113,11 +154,15 @@ func New(config Config, generator *bounce.Generator, processor Processor) (*Serv
 		}
 	}
 	return &Server{
-		config:    config,
-		generator: generator,
-		processor: processor,
-		conns:     make(map[net.Conn]struct{}),
-		capacity:  make(chan struct{}, config.MaxConnections),
+		config:     config,
+		generator:  generator,
+		processor:  processor,
+		conns:      make(map[net.Conn]struct{}),
+		capacity:   make(chan struct{}, config.MaxConnections),
+		trustedIPs: trustedIPs,
+		peerRates:  make(map[string]peerRate),
+		maxDSNRate: config.MaxDSNsPerPeerPerMinute,
+		requireTLS: config.TLSConfig != nil && config.TLSConfig.ClientAuth == tls.RequireAndVerifyClientCert,
 	}, nil
 }
 
@@ -137,6 +182,11 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	}
 	if listener == nil {
 		return errors.New("SMTP bounce listener is nil")
+	}
+	// Validate the actual listener too: callers of Serve may supply a socket
+	// whose bind address differs from Config.Address.
+	if err := validateListenerTrust(listener.Addr().String(), s.trustedIPs, s.config.TLSConfig); err != nil {
+		return err
 	}
 	var handlers sync.WaitGroup
 	stopWatcher := make(chan struct{})
@@ -162,6 +212,13 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 				return nil
 			}
 			return fmt.Errorf("accept inbound DSN connection: %w", err)
+		}
+		peerIP := remoteIP(conn.RemoteAddr())
+		if peerIP == nil || !s.isTrustedPeer(peerIP) {
+			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_, _ = io.WriteString(conn, "550 5.7.1 DSN receiver accepts connections only from trusted MTA peers\r\n")
+			_ = conn.Close()
+			continue
 		}
 		select {
 		case s.capacity <- struct{}{}:
@@ -316,6 +373,12 @@ func (s *Server) handleConnection(parent context.Context, conn net.Conn) {
 			// A new MAIL command starts a new SMTP transaction even when the
 			// supplied reverse-path is rejected.
 			resetTransaction()
+			if s.requireTLS && !secure {
+				if write("530 5.7.0 STARTTLS with a trusted client certificate is required before MAIL") != nil {
+					return
+				}
+				continue
+			}
 			if !greeted {
 				if write("503 5.5.1 Send EHLO or HELO first") != nil {
 					return
@@ -397,6 +460,14 @@ func (s *Server) handleConnection(parent context.Context, conn net.Conn) {
 				}
 				continue
 			}
+			peer := remoteIP(conn.RemoteAddr())
+			if peer == nil || !s.allowDSN(peer.String(), time.Now()) {
+				resetTransaction()
+				if write("451 4.7.0 DSN rate limit exceeded; retry later") != nil {
+					return
+				}
+				continue
+			}
 			processCtx, processCancel := context.WithTimeout(ctx, s.config.ProcessTimeout)
 			processErr := s.processor.ProcessDSN(processCtx, envelopeRecipient, raw)
 			processCancel()
@@ -435,6 +506,88 @@ func (s *Server) handleConnection(parent context.Context, conn net.Conn) {
 			}
 		}
 	}
+}
+
+func validateListenerTrust(address string, trustedIPs []*net.IPNet, tlsConfig *tls.Config) error {
+	if isLoopbackListenAddress(address) {
+		return nil
+	}
+	if len(trustedIPs) == 0 {
+		return errors.New("non-loopback DSN listener requires TrustedPeerCIDRs; place a trusted MTA in front and restrict its source addresses")
+	}
+	if tlsConfig == nil || tlsConfig.ClientAuth != tls.RequireAndVerifyClientCert || tlsConfig.ClientCAs == nil {
+		return errors.New("non-loopback DSN listener requires mutual TLS with a client CA (RequireAndVerifyClientCert) in addition to TrustedPeerCIDRs")
+	}
+	return nil
+}
+
+type peerRate struct {
+	windowStart time.Time
+	count       int
+}
+
+func remoteIP(address net.Addr) net.IP {
+	if address == nil {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(address.String())
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(strings.Trim(host, "[]"))
+}
+
+func isLoopbackListenAddress(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil || host == "" || strings.EqualFold(host, "localhost") {
+		return err == nil && strings.EqualFold(host, "localhost")
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func (s *Server) isTrustedPeer(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	if len(s.trustedIPs) == 0 {
+		return false
+	}
+	for _, network := range s.trustedIPs {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// allowDSN implements a per-source, per-process fixed-window limit. The map is
+// opportunistically pruned so expired peer entries do not grow without bound.
+func (s *Server) allowDSN(peer string, now time.Time) bool {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	window := time.Minute
+	state, ok := s.peerRates[peer]
+	if !ok || now.Sub(state.windowStart) >= window || now.Before(state.windowStart) {
+		state = peerRate{windowStart: now}
+	}
+	if state.count >= s.maxDSNRate {
+		s.peerRates[peer] = state
+		return false
+	}
+	state.count++
+	s.peerRates[peer] = state
+	if len(s.peerRates) > 4096 {
+		for address, entry := range s.peerRates {
+			if now.Sub(entry.windowStart) >= 2*window || now.Before(entry.windowStart) {
+				delete(s.peerRates, address)
+			}
+		}
+	}
+	return true
 }
 
 func readSMTPLine(reader *bufio.Reader) (string, error) {

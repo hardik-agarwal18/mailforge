@@ -132,7 +132,7 @@ func main() {
 
 	metricsAddr := os.Getenv("SUBMISSION_METRICS_ADDR")
 	if metricsAddr == "" {
-		metricsAddr = "0.0.0.0:9095"
+		metricsAddr = "127.0.0.1:9095"
 	}
 	metricsServer := &http.Server{
 		Addr:              metricsAddr,

@@ -12,7 +12,9 @@ MailForge includes several security controls, but the repository is a student/po
 - SMTP listener limits restrict concurrent connections, authentication, DATA handling, and recipient count.
 - DKIM signing supports managed key material and active/retiring selectors for rotation.
 - Bounce tokens use HMAC validation; DSN processing is idempotent and hard-bounce suppression is persisted.
-- Metrics and local infrastructure ports are intended to remain on loopback/private networks.
+- The DSN receiver accepts loopback peers by default. A non-loopback listener cannot start without an explicit trusted MTA source-IP/CIDR allowlist; DSN processing is rate-limited per source IP.
+- Submission and outbox-publisher metrics listeners default to loopback (`127.0.0.1`), not all interfaces.
+- Ambiguous delivery outcomes can only be reconciled through an explicit operator command that requires an actor and reason and writes a durable audit record.
 
 ## Secret handling
 
@@ -49,7 +51,10 @@ If a secret is accidentally committed, rotate it. Removing it from the latest co
 
 - Use a strong random VERP HMAC secret and keep it stable while outstanding VERP addresses can receive DSNs.
 - Configure the same bounce domain and HMAC secret across all workers and the bounce receiver.
-- Do not expose the sample bounce receiver to the public internet without a production TLS/network design and rate/connection controls.
+- Keep `SMTP_BOUNCE_LISTEN_ADDR` on loopback behind a trusted MTA wherever possible. If the receiver must bind to a non-loopback interface, set `SMTP_BOUNCE_TRUSTED_PEERS` to exact MTA IPs/CIDRs and configure `SMTP_BOUNCE_TLS_CLIENT_CA_FILE` with the CA that issued the MTA client certificate. The process refuses non-loopback binding without both a non-wildcard peer allowlist and mutual TLS (`RequireAndVerifyClientCert`).
+- Restrict the front MTA so only its DSN/bounce transport can reach the receiver. Apply firewall rules in addition to the application allowlist. Never put `0.0.0.0/0` or `::/0` in `SMTP_BOUNCE_TRUSTED_PEERS`.
+- Configure `SMTP_BOUNCE_MAX_DSNS_PER_PEER_PER_MINUTE` for expected MTA volume; the default is 300 per source IP per receiver process. For multiple receiver replicas, also enforce a shared limit at the front MTA or network edge. Monitor rate-limit responses and adjust deliberately.
+- The VERP HMAC authenticates the return-path token and recipient correlation; it does **not** cryptographically authenticate the DSN body or prove who authored it. The trusted MTA/IP boundary is an ingress control, not end-to-end DSN authenticity. Treat all DSN fields as untrusted claims, and review suppression decisions/abuse signals before broad public use.
 - Treat parsed DSN content as untrusted input. Do not render DSN fields as trusted HTML or use them as shell input.
 
 ## Before any public deployment
@@ -58,6 +63,7 @@ If a secret is accidentally committed, rotate it. Removing it from the latest co
 - [ ] Use managed secrets and rotate all credentials/keys under a documented process.
 - [ ] Configure valid certificates and enforce the intended TLS policy for all external SMTP hops.
 - [ ] Bind database, Redis, metrics, and admin interfaces to private networks; enforce firewall rules.
+- [ ] Put inbound DSN reception behind a trusted MTA, configure `SMTP_BOUNCE_TRUSTED_PEERS`, verify the network boundary and test rate limits before accepting public bounce traffic.
 - [ ] Configure SPF, DKIM, and DMARC DNS records and monitor alignment and delivery reputation.
 - [ ] Add abuse detection, recipient/domain allowlists or onboarding controls, bounce/complaint handling, and sending-rate policies appropriate to the service.
 - [ ] Define retention and deletion policy for message bodies, addresses, logs, and delivery events.

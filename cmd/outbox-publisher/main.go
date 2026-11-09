@@ -68,7 +68,7 @@ func main() {
 
 	metricsAddr := os.Getenv("OUTBOX_METRICS_ADDR")
 	if metricsAddr == "" {
-		metricsAddr = "0.0.0.0:9096"
+		metricsAddr = "127.0.0.1:9096"
 	}
 	metricsServer := &http.Server{
 		Addr:              metricsAddr,

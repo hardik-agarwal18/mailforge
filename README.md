@@ -14,8 +14,9 @@ It is a **mail-delivery backend**, not a Gmail replacement or hosted mailbox ser
 - Concurrent delivery workers with PostgreSQL leases, heartbeats, retries, dead-letter handling, and pending-entry recovery.
 - Outbound SMTP delivery with MX lookup or an explicitly configured relay, TLS policy, and SMTP response classification.
 - DKIM signing with configurable key material and keyset rotation support.
-- VERP/HMAC bounce correlation, DSN processing, and hard-bounce suppression.
-- Read-only delivery status CLI, Prometheus metrics, Grafana dashboards, and alert rules.
+- VERP/HMAC bounce correlation, trusted-MTA DSN ingestion controls, and hard-bounce suppression.
+- Read-only delivery status CLI plus audited operator reconciliation for ambiguous outcomes.
+- Prometheus metrics defaulting to loopback, Grafana dashboards, and alert rules.
 - Integration coverage for successful delivery, temporary/permanent SMTP failures, retries, duplicate events, ambiguous outcomes, Redis consumer recovery, and DSN suppression.
 
 See [Architecture](docs/architecture.md) for the component flow, [Benchmarking](docs/benchmarking.md) for repeatable performance measurements, and [Project scope](docs/project-scope.md) for explicit limitations.
@@ -35,7 +36,7 @@ See [Architecture](docs/architecture.md) for the component flow, [Benchmarking](
 | `internal/dkimsign/` | DKIM message signing and key management |
 | `internal/bounce/`, `internal/bouncereceiver/`, `internal/dsn/` | Bounce addressing, inbound DSN reception, and report parsing |
 | `internal/observability/` | Prometheus metrics and PostgreSQL pool instrumentation |
-| `migrations/` | Ordered PostgreSQL schema migrations (14 migrations currently) |
+| `migrations/` | Ordered PostgreSQL schema migrations (15 migrations currently) |
 | `deployments/` | Local Docker Compose dependencies, Prometheus, Grafana, Alertmanager, and exporters |
 | `docs/` | Architecture, operations, security, testing, and CLI documentation |
 
@@ -164,7 +165,7 @@ go run ./cmd/smtp-bounce
 
 SMTP submission listens on `127.0.0.1:1587` with the sample `.env`. The local injection listener uses `127.0.0.1:2525`; the bounce receiver defaults to `127.0.0.1:2526`. Metrics listeners are configured separately per process; do not expose metrics endpoints publicly.
 
-For the complete authenticated submission-to-Mailpit smoke test, see [Reliability testing](docs/reliability-testing.md). For message status lookups, see [Delivery status CLI](docs/delivery-status-cli.md). For the final performance matrix, see [Benchmarking](docs/benchmarking.md).
+For operations and recovery procedures, see [Operations](docs/operations.md). For ambiguous recipient outcomes, see [Delivery reconciliation](docs/delivery-reconciliation.md). For performance measurements, see [Benchmarking](docs/benchmarking.md).
 
 ## Automated worker-scaling experiment
 

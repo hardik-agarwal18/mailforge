@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -91,8 +92,12 @@ func run() error {
 	var tlsConfig *tls.Config
 	certFile := strings.TrimSpace(os.Getenv("SMTP_BOUNCE_TLS_CERT_FILE"))
 	keyFile := strings.TrimSpace(os.Getenv("SMTP_BOUNCE_TLS_KEY_FILE"))
+	clientCAFile := strings.TrimSpace(os.Getenv("SMTP_BOUNCE_TLS_CLIENT_CA_FILE"))
 	if (certFile == "") != (keyFile == "") {
 		return errors.New("SMTP_BOUNCE_TLS_CERT_FILE and SMTP_BOUNCE_TLS_KEY_FILE must be set together")
+	}
+	if clientCAFile != "" && certFile == "" {
+		return errors.New("SMTP_BOUNCE_TLS_CLIENT_CA_FILE requires the bounce server TLS certificate and key")
 	}
 	if certFile != "" {
 		certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
@@ -100,9 +105,25 @@ func run() error {
 			return fmt.Errorf("load inbound bounce TLS certificate: %w", err)
 		}
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+		if clientCAFile != "" {
+			caPEM, err := os.ReadFile(clientCAFile)
+			if err != nil {
+				return fmt.Errorf("read inbound bounce client CA: %w", err)
+			}
+			clientCAs := x509.NewCertPool()
+			if ok := clientCAs.AppendCertsFromPEM(caPEM); !ok {
+				return errors.New("SMTP_BOUNCE_TLS_CLIENT_CA_FILE contains no valid CA certificates")
+			}
+			tlsConfig.ClientCAs = clientCAs
+			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+		}
 	}
 
 	maxConnections, err := envPositiveInt("SMTP_BOUNCE_MAX_CONNECTIONS", 100)
+	if err != nil {
+		return err
+	}
+	maxDSNsPerPeer, err := envPositiveInt("SMTP_BOUNCE_MAX_DSNS_PER_PEER_PER_MINUTE", 300)
 	if err != nil {
 		return err
 	}
@@ -111,11 +132,13 @@ func run() error {
 		return err
 	}
 	config := bouncereceiver.Config{
-		Address:        envString("SMTP_BOUNCE_LISTEN_ADDR", "127.0.0.1:2526"),
-		Hostname:       envString("SMTP_BOUNCE_HOSTNAME", "localhost"),
-		MaxConnections: maxConnections,
-		ProcessTimeout: processTimeout,
-		TLSConfig:      tlsConfig,
+		Address:                 envString("SMTP_BOUNCE_LISTEN_ADDR", "127.0.0.1:2526"),
+		Hostname:                envString("SMTP_BOUNCE_HOSTNAME", "localhost"),
+		MaxConnections:          maxConnections,
+		MaxDSNsPerPeerPerMinute: maxDSNsPerPeer,
+		TrustedPeerCIDRs:        envCSV("SMTP_BOUNCE_TRUSTED_PEERS"),
+		ProcessTimeout:          processTimeout,
+		TLSConfig:               tlsConfig,
 	}
 	processor := &dsnProcessor{repository: delivery.NewRepository(pool), generator: generator}
 	server, err := bouncereceiver.New(config, generator, processor)
@@ -132,6 +155,21 @@ func run() error {
 	}
 	log.Printf("MailForge inbound DSN receiver stopped")
 	return nil
+}
+
+func envCSV(name string) []string {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }
 
 func envString(name, fallback string) string {

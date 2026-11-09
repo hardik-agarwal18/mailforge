@@ -946,3 +946,46 @@ func integrationRedis(t *testing.T) (*redis.Client, *Consumer) {
 	})
 	return client, consumer
 }
+
+func TestIntegrationReconcileUnknownRecipientCreatesAuditAndOutbox(t *testing.T) {
+	db := integrationPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	recipientID, _ := integrationCreateRecipient(t, ctx, db)
+	if _, err := db.Exec(ctx, `UPDATE recipients SET status = 'unknown', attempts = 1, unknown_at = NOW() WHERE id = $1::uuid`, recipientID); err != nil {
+		t.Fatalf("prepare unknown recipient: %v", err)
+	}
+
+	err := NewRepository(db).ReconcileUnknownRecipient(ctx, UnknownReconciliation{
+		RecipientID: recipientID,
+		Decision:    "retry",
+		Actor:       "oncall@example.test",
+		Reason:      "Remote MTA logs confirm the connection ended before DATA acceptance",
+		Evidence:    "INC-1234 / mx-relay-02 log window 12:00-12:02 UTC",
+	})
+	if err != nil {
+		t.Fatalf("reconcile unknown recipient: %v", err)
+	}
+
+	var status, decision, actor, databaseRole, reason string
+	var outboxCount int
+	if err := db.QueryRow(ctx, `SELECT status FROM recipients WHERE id = $1::uuid`, recipientID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `SELECT decision, actor, database_role, reason FROM delivery_reconciliations WHERE recipient_id = $1::uuid`, recipientID).Scan(&decision, &actor, &databaseRole, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1::uuid AND idempotency_key = 'recipient.delivery_requested:' || $1::text || ':2'`, recipientID).Scan(&outboxCount); err != nil {
+		t.Fatal(err)
+	}
+	if status != "deferred" || decision != "retry" || actor != "oncall@example.test" || databaseRole == "" || !strings.Contains(reason, "Remote MTA logs") || outboxCount != 1 {
+		t.Fatalf("reconciliation result status=%q decision=%q actor=%q database_role=%q reason=%q outbox=%d", status, decision, actor, databaseRole, reason, outboxCount)
+	}
+
+	if err := NewRepository(db).ReconcileUnknownRecipient(ctx, UnknownReconciliation{
+		RecipientID: recipientID, Decision: "retry", Actor: "oncall@example.test", Reason: "duplicate decision",
+	}); !errors.Is(err, ErrRecipientNotUnknown) {
+		t.Fatalf("second reconciliation error = %v, want ErrRecipientNotUnknown", err)
+	}
+}
