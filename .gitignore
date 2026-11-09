@@ -9,3 +9,5 @@ coverage.out
 
 certs
 *.sh
+
+secrets
