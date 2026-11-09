@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mailforge-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Format, test, vet, race, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:17.11-alpine
+        env:
+          POSTGRES_DB: mailforge_ci
+          POSTGRES_USER: mailforge_ci
+          POSTGRES_PASSWORD: mailforge_ci_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mailforge_ci -d mailforge_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7.4.12-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MAILFORGE_TEST_DATABASE_URL: postgres://mailforge_ci:mailforge_ci_test_password@127.0.0.1:5432/mailforge_ci?sslmode=disable
+      MAILFORGE_TEST_REDIS_ADDR: 127.0.0.1:6379
+      MAILFORGE_TEST_REDIS_PASSWORD: ""
+      MAILFORGE_TEST_REDIS_DB: "15"
+      REDIS_TEST_ADDR: 127.0.0.1:6379
+      REDIS_TEST_PASSWORD: ""
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Show Go version
+        run: go version
+
+      - name: Check gofmt
+        shell: bash
+        run: |
+          files="$(gofmt -l $(find cmd internal -type f -name '*.go'))"
+          if [[ -n "$files" ]]; then
+            printf 'The following Go files need gofmt:\n%s\n' "$files"
+            exit 1
+          fi
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (including PostgreSQL and Redis integration tests)
+        run: go test ./... -count=1
+
+      - name: Race test critical concurrent packages
+        run: go test -race -count=1 ./internal/delivery ./internal/deliverybench ./internal/smtp
+
+      - name: Build every command
+        run: go build ./cmd/...

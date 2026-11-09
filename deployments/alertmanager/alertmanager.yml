@@ -17,5 +17,5 @@ route:
 receivers:
   - name: "mailforge-email"
     email_configs:
-      - to: "hardik.agarwal18.work@gmail.com"
+      - to: "mailforge-alerts@localhost"
         send_resolved: true
