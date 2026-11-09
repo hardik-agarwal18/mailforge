@@ -3,11 +3,96 @@ package delivery
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
+
+// ResolveMessageID accepts either the internal message UUID or the RFC 5322
+// Message-ID stored at submission time and returns the internal UUID used by
+// recipient and delivery-status records.
+func (r *Repository) ResolveMessageID(ctx context.Context, identifier string) (string, error) {
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return "", ErrMessageNotFound
+	}
+	var messageUUID string
+	var err error
+	if parsed, parseErr := uuid.Parse(identifier); parseErr == nil {
+		err = r.db.QueryRow(ctx, `
+			SELECT id::text
+			FROM messages
+			WHERE id = $1::uuid
+		`, parsed.String()).Scan(&messageUUID)
+	} else {
+		err = r.db.QueryRow(ctx, `
+			SELECT id::text
+			FROM messages
+			WHERE message_id = $1
+		`, identifier).Scan(&messageUUID)
+	}
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return "", ErrMessageNotFound
+		}
+		return "", fmt.Errorf("resolve message identifier: %w", err)
+	}
+	return messageUUID, nil
+}
+
+// ListMessageRecipientDeliveryStatuses returns each envelope recipient's
+// current durable delivery state in stable creation order.
+func (r *Repository) ListMessageRecipientDeliveryStatuses(
+	ctx context.Context,
+	messageID string,
+) ([]RecipientDeliveryStatus, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT
+			r.id::text,
+			r.message_id::text,
+			r.email,
+			r.status,
+			r.attempts,
+			r.created_at,
+			r.updated_at,
+			r.next_attempt_at,
+			r.last_attempt_at,
+			r.delivered_at,
+			r.bounced_at,
+			r.unknown_at,
+			r.final_delivery_confirmed_at,
+			r.last_smtp_code,
+			r.last_enhanced_status_code,
+			r.last_smtp_stage,
+			r.last_error
+		FROM recipients r
+		WHERE r.message_id = $1::uuid
+		ORDER BY r.created_at, r.id
+	`, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("list message recipient delivery statuses: %w", err)
+	}
+	defer rows.Close()
+
+	statuses := make([]RecipientDeliveryStatus, 0)
+	for rows.Next() {
+		status, err := scanRecipientDeliveryStatus(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan message recipient delivery status: %w", err)
+		}
+		statuses = append(statuses, *status)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate message recipient delivery statuses: %w", err)
+	}
+	if len(statuses) == 0 {
+		return nil, ErrMessageNotFound
+	}
+	return statuses, nil
+}
 
 // GetRecipientDeliveryStatus returns the latest durable status and useful
 // operational timestamps for one envelope recipient.
@@ -15,12 +100,7 @@ func (r *Repository) GetRecipientDeliveryStatus(
 	ctx context.Context,
 	recipientID string,
 ) (*RecipientDeliveryStatus, error) {
-	var status RecipientDeliveryStatus
-	var nextAttemptAt, lastAttemptAt, deliveredAt, bouncedAt, unknownAt, finalDeliveryConfirmedAt pgtype.Timestamptz
-	var lastSMTPCode pgtype.Int4
-	var enhancedStatus, smtpStage, lastError pgtype.Text
-
-	err := r.db.QueryRow(ctx, `
+	status, err := scanRecipientDeliveryStatus(r.db.QueryRow(ctx, `
 		SELECT
 			r.id::text,
 			r.message_id::text,
@@ -41,52 +121,14 @@ func (r *Repository) GetRecipientDeliveryStatus(
 			r.last_error
 		FROM recipients r
 		WHERE r.id = $1::uuid
-	`, recipientID).Scan(
-		&status.RecipientID,
-		&status.MessageID,
-		&status.Email,
-		&status.Status,
-		&status.Attempts,
-		&status.CreatedAt,
-		&status.UpdatedAt,
-		&nextAttemptAt,
-		&lastAttemptAt,
-		&deliveredAt,
-		&bouncedAt,
-		&unknownAt,
-		&finalDeliveryConfirmedAt,
-		&lastSMTPCode,
-		&enhancedStatus,
-		&smtpStage,
-		&lastError,
-	)
+	`, recipientID))
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, ErrRecipientNotFound
 		}
 		return nil, fmt.Errorf("get recipient delivery status: %w", err)
 	}
-
-	status.NextAttemptAt = nullableTimestamp(nextAttemptAt)
-	status.LastAttemptAt = nullableTimestamp(lastAttemptAt)
-	status.DeliveredAt = nullableTimestamp(deliveredAt)
-	status.BouncedAt = nullableTimestamp(bouncedAt)
-	status.UnknownAt = nullableTimestamp(unknownAt)
-	status.FinalDeliveryConfirmedAt = nullableTimestamp(finalDeliveryConfirmedAt)
-	if lastSMTPCode.Valid {
-		code := int(lastSMTPCode.Int32)
-		status.LastSMTPCode = &code
-	}
-	if enhancedStatus.Valid {
-		status.LastEnhancedStatus = enhancedStatus.String
-	}
-	if smtpStage.Valid {
-		status.LastSMTPStage = smtpStage.String
-	}
-	if lastError.Valid {
-		status.LastError = lastError.String
-	}
-	return &status, nil
+	return status, nil
 }
 
 // ListRecipientDeliveryEvents returns the recipient's immutable status
@@ -235,6 +277,61 @@ func (r *Repository) GetMessageDeliverySummary(
 		return nil, fmt.Errorf("get message delivery summary: %w", err)
 	}
 	return &summary, nil
+}
+
+type recipientStatusScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanRecipientDeliveryStatus(row recipientStatusScanner) (*RecipientDeliveryStatus, error) {
+	var status RecipientDeliveryStatus
+	var nextAttemptAt, lastAttemptAt, deliveredAt, bouncedAt, unknownAt, finalDeliveryConfirmedAt pgtype.Timestamptz
+	var lastSMTPCode pgtype.Int4
+	var enhancedStatus, smtpStage, lastError pgtype.Text
+
+	err := row.Scan(
+		&status.RecipientID,
+		&status.MessageID,
+		&status.Email,
+		&status.Status,
+		&status.Attempts,
+		&status.CreatedAt,
+		&status.UpdatedAt,
+		&nextAttemptAt,
+		&lastAttemptAt,
+		&deliveredAt,
+		&bouncedAt,
+		&unknownAt,
+		&finalDeliveryConfirmedAt,
+		&lastSMTPCode,
+		&enhancedStatus,
+		&smtpStage,
+		&lastError,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	status.NextAttemptAt = nullableTimestamp(nextAttemptAt)
+	status.LastAttemptAt = nullableTimestamp(lastAttemptAt)
+	status.DeliveredAt = nullableTimestamp(deliveredAt)
+	status.BouncedAt = nullableTimestamp(bouncedAt)
+	status.UnknownAt = nullableTimestamp(unknownAt)
+	status.FinalDeliveryConfirmedAt = nullableTimestamp(finalDeliveryConfirmedAt)
+	if lastSMTPCode.Valid {
+		code := int(lastSMTPCode.Int32)
+		status.LastSMTPCode = &code
+	}
+	if enhancedStatus.Valid {
+		status.LastEnhancedStatus = enhancedStatus.String
+	}
+	if smtpStage.Valid {
+		status.LastSMTPStage = smtpStage.String
+	}
+	if lastError.Valid {
+		status.LastError = lastError.String
+	}
+	return &status, nil
 }
 
 func nullableTimestamp(value pgtype.Timestamptz) *time.Time {
