@@ -18,7 +18,11 @@ const defaultMockMaxMessageBytes int64 = 15 << 20
 
 // MockSMTPConfig controls deterministic failures in the local SMTP receiver.
 type MockSMTPConfig struct {
-	Delay                 time.Duration
+	Delay time.Duration
+	// RejectFirst rejects the first N RCPT TO commands. It is useful for
+	// deterministic temporary-failure/retry tests where a later attempt must
+	// succeed without changing the server configuration.
+	RejectFirst           int64
 	RejectEvery           int64
 	RejectCode            int
 	DropAfterDATAEvery    int64
@@ -69,7 +73,7 @@ func StartMockSMTPServer(addr string, config MockSMTPConfig) (*MockSMTPServer, e
 	if config.Delay < 0 {
 		return nil, fmt.Errorf("mock SMTP delay cannot be negative")
 	}
-	if config.RejectEvery < 0 || config.DropAfterDATAEvery < 0 {
+	if config.RejectFirst < 0 || config.RejectEvery < 0 || config.DropAfterDATAEvery < 0 {
 		return nil, fmt.Errorf("mock SMTP failure intervals cannot be negative")
 	}
 	if config.RejectCode == 0 {
@@ -203,7 +207,9 @@ func (s *MockSMTPServer) handleConnection(conn net.Conn) {
 			}
 		case strings.HasPrefix(upper, "RCPT TO:"):
 			n := s.recipientAttempts.Add(1)
-			if s.config.RejectEvery > 0 && n%s.config.RejectEvery == 0 {
+			reject := n <= s.config.RejectFirst ||
+				(s.config.RejectEvery > 0 && n%s.config.RejectEvery == 0)
+			if reject {
 				s.rejectedRecipients.Add(1)
 				if s.config.RejectCode == 550 {
 					if _, err := fmt.Fprint(conn, "550 5.1.1 simulated permanent recipient rejection\r\n"); err != nil {

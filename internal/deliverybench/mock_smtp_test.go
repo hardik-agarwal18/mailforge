@@ -64,6 +64,41 @@ func TestMockSMTPRejectsConfiguredRecipient(t *testing.T) {
 	}
 }
 
+func TestMockSMTPRejectsFirstRecipientThenAcceptsNext(t *testing.T) {
+	server, err := StartMockSMTPServer("127.0.0.1:0", MockSMTPConfig{
+		RejectFirst: 1,
+		RejectCode:  451,
+	})
+	if err != nil {
+		t.Fatalf("start mock SMTP server: %v", err)
+	}
+	defer server.Close()
+
+	client := dialMockClient(t, server.Addr().String())
+	defer client.Close()
+
+	if err := client.Mail("sender@example.test"); err != nil {
+		t.Fatalf("first MAIL FROM: %v", err)
+	}
+	if err := client.Rcpt("recipient@example.test"); err == nil {
+		t.Fatal("first RCPT TO succeeded; want configured 451 rejection")
+	}
+	if err := client.Reset(); err != nil {
+		t.Fatalf("RSET after temporary rejection: %v", err)
+	}
+	if err := client.Mail("sender@example.test"); err != nil {
+		t.Fatalf("second MAIL FROM: %v", err)
+	}
+	if err := client.Rcpt("recipient@example.test"); err != nil {
+		t.Fatalf("second RCPT TO failed; want acceptance: %v", err)
+	}
+
+	stats := server.Stats()
+	if stats.RejectedRecipients != 1 || stats.AcceptedRecipients != 1 {
+		t.Fatalf("mock stats = %+v, want one rejection and one acceptance", stats)
+	}
+}
+
 func TestMockSMTPCanDropAfterDATAAcceptance(t *testing.T) {
 	server, err := StartMockSMTPServer("127.0.0.1:0", MockSMTPConfig{
 		DropAfterDATAEvery: 1,

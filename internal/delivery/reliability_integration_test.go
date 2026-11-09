@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +21,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"mailforge/internal/bounce"
+	"mailforge/internal/deliverybench"
 	"mailforge/internal/outbound"
 )
 
@@ -26,6 +29,209 @@ import (
 // Set MAILFORGE_TEST_DATABASE_URL and/or MAILFORGE_TEST_REDIS_ADDR to enable
 // them. The Redis database must be a disposable test database; the tests only
 // create and delete uniquely named streams.
+
+func TestIntegrationSuccessfulDeliveryThroughSMTPRelay(t *testing.T) {
+	db := integrationPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	recipientID, messageID := integrationCreateRecipient(t, ctx, db)
+	mock, relay := startIntegrationMockSMTP(t, deliverybench.MockSMTPConfig{})
+	processor := NewProcessor(NewRepository(db), relay)
+	job := DeliveryJob{
+		RecipientID: recipientID,
+		MessageID:   messageID,
+		Email:       "recipient@example.test",
+	}
+
+	if err := processor.Process(ctx, job); err != nil {
+		t.Fatalf("process successful SMTP relay delivery: %v", err)
+	}
+
+	stats := mock.Stats()
+	if stats.AcceptedMessages != 1 || stats.AcceptedRecipients != 1 {
+		t.Fatalf("mock SMTP stats = %+v, want one accepted message and recipient", stats)
+	}
+
+	var status string
+	var attempts int
+	var smtpCode int
+	var remoteHost string
+	var tlsMode string
+	if err := db.QueryRow(ctx, `
+		SELECT r.status, r.attempts, a.smtp_code, a.remote_host, a.tls_mode
+		FROM recipients r
+		JOIN delivery_attempts a ON a.recipient_id = r.id
+		WHERE r.id = $1::uuid
+	`, recipientID).Scan(&status, &attempts, &smtpCode, &remoteHost, &tlsMode); err != nil {
+		t.Fatalf("read successful SMTP delivery result: %v", err)
+	}
+	if status != "delivered" || attempts != 1 || smtpCode != 250 {
+		t.Fatalf("delivery result = %s/%d attempts/SMTP %d, want delivered/1/250", status, attempts, smtpCode)
+	}
+	if remoteHost != "127.0.0.1" || tlsMode != string(outbound.TLSModeNone) {
+		t.Fatalf("transport details = host %q / TLS mode %q, want loopback / none", remoteHost, tlsMode)
+	}
+}
+
+func TestIntegrationTemporarySMTPFailureRetriesAndEventuallyDelivers(t *testing.T) {
+	db := integrationPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	recipientID, messageID := integrationCreateRecipient(t, ctx, db)
+	mock, relay := startIntegrationMockSMTP(t, deliverybench.MockSMTPConfig{
+		RejectFirst: 1,
+		RejectCode:  451,
+	})
+	policy := RetryPolicy{
+		InitialDelay: 40 * time.Millisecond,
+		MaxDelay:     100 * time.Millisecond,
+		MaxQueueAge:  time.Hour,
+		MaxAttempts:  3,
+	}
+	repository, err := NewRepositoryWithRetryPolicy(db, policy)
+	if err != nil {
+		t.Fatalf("create repository with fast integration retry policy: %v", err)
+	}
+	processor := NewProcessor(repository, relay)
+	job := DeliveryJob{
+		RecipientID: recipientID,
+		MessageID:   messageID,
+		Email:       "recipient@example.test",
+	}
+
+	if err := processor.Process(ctx, job); err != nil {
+		t.Fatalf("process initial temporary SMTP failure: %v", err)
+	}
+
+	var status string
+	var attempts int
+	var smtpCode int
+	var enhancedStatus string
+	var smtpStage string
+	var nextAttemptAt time.Time
+	if err := db.QueryRow(ctx, `
+		SELECT status, attempts, last_smtp_code,
+		       last_enhanced_status_code, last_smtp_stage, next_attempt_at
+		FROM recipients WHERE id = $1::uuid
+	`, recipientID).Scan(&status, &attempts, &smtpCode, &enhancedStatus, &smtpStage, &nextAttemptAt); err != nil {
+		t.Fatalf("read deferred recipient state: %v", err)
+	}
+	if status != "deferred" || attempts != 1 || smtpCode != 451 {
+		t.Fatalf("first attempt state = %s/%d/SMTP %d, want deferred/1/451", status, attempts, smtpCode)
+	}
+	if enhancedStatus != "4.3.0" || smtpStage != "rcpt_to" {
+		t.Fatalf("temporary SMTP diagnostics = %q at %q, want 4.3.0 at rcpt_to", enhancedStatus, smtpStage)
+	}
+
+	var retryEvents int
+	var outboxAvailableAt time.Time
+	if err := db.QueryRow(ctx, `
+		SELECT COUNT(*)::integer, MIN(available_at)
+		FROM outbox_events
+		WHERE aggregate_id = $1::uuid
+		  AND event_type = 'recipient.delivery_requested'
+	`, recipientID).Scan(&retryEvents, &outboxAvailableAt); err != nil {
+		t.Fatalf("count transactional retry events: %v", err)
+	}
+	if retryEvents != 1 {
+		t.Fatalf("retry outbox events = %d, want exactly 1", retryEvents)
+	}
+	if !outboxAvailableAt.Equal(nextAttemptAt) {
+		t.Fatalf("recipient retry time %s differs from outbox availability %s", nextAttemptAt, outboxAvailableAt)
+	}
+	if err := processor.Process(ctx, job); !errors.Is(err, ErrRecipientScheduled) {
+		t.Fatalf("duplicate pre-deadline delivery event error = %v, want ErrRecipientScheduled", err)
+	}
+
+	if wait := time.Until(nextAttemptAt); wait > 0 {
+		timer := time.NewTimer(wait + 20*time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			t.Fatal("retry became due after integration test deadline")
+		}
+	}
+
+	if err := processor.Process(ctx, job); err != nil {
+		t.Fatalf("process scheduled SMTP retry: %v", err)
+	}
+	var finalStatus string
+	var finalAttempts int
+	if err := db.QueryRow(ctx, `
+		SELECT status, attempts FROM recipients WHERE id = $1::uuid
+	`, recipientID).Scan(&finalStatus, &finalAttempts); err != nil {
+		t.Fatalf("read final retry state: %v", err)
+	}
+	if finalStatus != "delivered" || finalAttempts != 2 {
+		t.Fatalf("final retry state = %s/%d attempts, want delivered/2", finalStatus, finalAttempts)
+	}
+
+	stats := mock.Stats()
+	if stats.RejectedRecipients != 1 || stats.AcceptedRecipients != 1 || stats.AcceptedMessages != 1 {
+		t.Fatalf("mock SMTP stats = %+v, want one 451 rejection followed by one accepted message", stats)
+	}
+
+	var temporaryAttempts int
+	var successfulAttempts int
+	if err := db.QueryRow(ctx, `
+		SELECT
+			COUNT(*) FILTER (WHERE status = 'temporary_failure')::integer,
+			COUNT(*) FILTER (WHERE status = 'success')::integer
+		FROM delivery_attempts
+		WHERE recipient_id = $1::uuid
+	`, recipientID).Scan(&temporaryAttempts, &successfulAttempts); err != nil {
+		t.Fatalf("read persisted retry attempts: %v", err)
+	}
+	if temporaryAttempts != 1 || successfulAttempts != 1 {
+		t.Fatalf("persisted attempts = temporary %d / success %d, want 1 / 1", temporaryAttempts, successfulAttempts)
+	}
+}
+
+func TestIntegrationPermanentSMTPFailureMarksRecipientBounced(t *testing.T) {
+	db := integrationPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	recipientID, messageID := integrationCreateRecipient(t, ctx, db)
+	mock, relay := startIntegrationMockSMTP(t, deliverybench.MockSMTPConfig{
+		RejectFirst: 1,
+		RejectCode:  550,
+	})
+	processor := NewProcessor(NewRepository(db), relay)
+	job := DeliveryJob{
+		RecipientID: recipientID,
+		MessageID:   messageID,
+		Email:       "recipient@example.test",
+	}
+
+	if err := processor.Process(ctx, job); err != nil {
+		t.Fatalf("process permanent SMTP rejection: %v", err)
+	}
+
+	var status string
+	var attempts int
+	var smtpCode int
+	var enhancedStatus string
+	if err := db.QueryRow(ctx, `
+		SELECT status, attempts, last_smtp_code, last_enhanced_status_code
+		FROM recipients WHERE id = $1::uuid
+	`, recipientID).Scan(&status, &attempts, &smtpCode, &enhancedStatus); err != nil {
+		t.Fatalf("read permanent SMTP failure result: %v", err)
+	}
+	if status != "bounced" || attempts != 1 || smtpCode != 550 {
+		t.Fatalf("permanent failure state = %s/%d/SMTP %d, want bounced/1/550", status, attempts, smtpCode)
+	}
+	if enhancedStatus != "5.1.1" {
+		t.Fatalf("permanent enhanced status = %q, want 5.1.1", enhancedStatus)
+	}
+	stats := mock.Stats()
+	if stats.RejectedRecipients != 1 || stats.AcceptedMessages != 0 {
+		t.Fatalf("mock SMTP stats = %+v, want one rejected recipient and no accepted message", stats)
+	}
+}
 
 func TestIntegrationDuplicateEventsDoNotSendTwice(t *testing.T) {
 	db := integrationPostgres(t)
@@ -333,12 +539,133 @@ func TestIntegrationRedisPendingEntryCanBeReclaimedAfterConsumerCrash(t *testing
 	}
 }
 
+func TestIntegrationReclaimedPendingDeliveryIsProcessedAndAcknowledged(t *testing.T) {
+	db := integrationPostgres(t)
+	redisClient, firstConsumer := integrationRedis(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	recipientID, messageID := integrationCreateRecipient(t, ctx, db)
+	payload, err := json.Marshal(DeliveryJob{
+		RecipientID: recipientID,
+		MessageID:   messageID,
+		Email:       "recipient@example.test",
+	})
+	if err != nil {
+		t.Fatalf("marshal delivery payload: %v", err)
+	}
+
+	entryID, err := redisClient.XAdd(ctx, &redis.XAddArgs{
+		Stream: firstConsumer.stream,
+		Values: map[string]interface{}{
+			"event_type":   "recipient.delivery_requested",
+			"aggregate_id": recipientID,
+			"payload":      string(payload),
+		},
+	}).Result()
+	if err != nil {
+		t.Fatalf("append delivery event: %v", err)
+	}
+
+	jobs, err := firstConsumer.Read(ctx, 1)
+	if err != nil {
+		t.Fatalf("first consumer read delivery event: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].EventID != entryID {
+		t.Fatalf("first consumer jobs = %#v, want event %s", jobs, entryID)
+	}
+	// Simulate the process dying after XREADGROUP persisted the Redis pending
+	// entry, but before the application starts SMTP delivery.
+
+	time.Sleep(firstConsumer.pendingIdleTimeout + 20*time.Millisecond)
+	secondConsumer := *firstConsumer
+	secondConsumer.consumerName = "recovery-" + uuid.NewString()
+	reclaimed, _, err := secondConsumer.ClaimStale(ctx, "0-0", 1)
+	if err != nil {
+		t.Fatalf("recovery consumer claim stale delivery: %v", err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].EventID != entryID {
+		t.Fatalf("reclaimed jobs = %#v, want event %s", reclaimed, entryID)
+	}
+
+	sender := &integrationSender{}
+	processor := NewProcessor(NewRepository(db), sender)
+	if err := processor.Process(ctx, reclaimed[0]); err != nil {
+		t.Fatalf("process reclaimed delivery: %v", err)
+	}
+	if got := sender.calls.Load(); got != 1 {
+		t.Fatalf("SMTP sends after recovery = %d, want exactly 1", got)
+	}
+	if err := secondConsumer.Acknowledge(ctx, entryID); err != nil {
+		t.Fatalf("acknowledge processed recovery event: %v", err)
+	}
+
+	var status string
+	var attempts int
+	if err := db.QueryRow(ctx, `
+		SELECT status, attempts FROM recipients WHERE id = $1::uuid
+	`, recipientID).Scan(&status, &attempts); err != nil {
+		t.Fatalf("read recovered recipient state: %v", err)
+	}
+	if status != "delivered" || attempts != 1 {
+		t.Fatalf("recovered recipient state = %s/%d, want delivered/1", status, attempts)
+	}
+
+	pending, err := redisClient.XPending(ctx, secondConsumer.stream, secondConsumer.group).Result()
+	if err != nil {
+		t.Fatalf("inspect recovered pending entries: %v", err)
+	}
+	if pending.Count != 0 {
+		t.Fatalf("pending entries after recovered delivery = %d, want 0", pending.Count)
+	}
+}
+
 type integrationSender struct {
 	calls   atomic.Int64
 	started chan struct{}
 	release chan struct{}
 	sendErr error
 	once    sync.Once
+}
+
+func startIntegrationMockSMTP(
+	t *testing.T,
+	config deliverybench.MockSMTPConfig,
+) (*deliverybench.MockSMTPServer, *outbound.Client) {
+	t.Helper()
+
+	server, err := deliverybench.StartMockSMTPServer("127.0.0.1:0", config)
+	if err != nil {
+		t.Fatalf("start integration SMTP receiver: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("close integration SMTP receiver: %v", err)
+		}
+	})
+
+	host, rawPort, err := net.SplitHostPort(server.Addr().String())
+	if err != nil {
+		t.Fatalf("split integration SMTP receiver address: %v", err)
+	}
+	port, err := strconv.Atoi(rawPort)
+	if err != nil {
+		t.Fatalf("parse integration SMTP receiver port: %v", err)
+	}
+
+	client, err := outbound.NewRelayClient(outbound.Config{
+		RelayHost:        host,
+		RelayPort:        port,
+		RelayTLSMode:     outbound.TLSModeNone,
+		EHLOName:         "mailforge-integration.test",
+		ConnectTimeout:   time.Second,
+		OperationTimeout: time.Second,
+		DeliveryTimeout:  5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("create integration SMTP relay client: %v", err)
+	}
+	return server, client
 }
 
 func (s *integrationSender) Send(ctx context.Context, _, _ string, _ []byte) error {
