@@ -8,6 +8,7 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -25,6 +26,10 @@ const minimumRSABits = 2048
 // canonicalization. The key is loaded once at process startup and reused for
 // each recipient delivery. A Signer is safe for concurrent use because the
 // private key and options are immutable after construction.
+type MessageSigner interface {
+	Sign(raw []byte) ([]byte, error)
+}
+
 type Signer struct {
 	options dkim.SignOptions
 }
@@ -63,6 +68,35 @@ func NewSigner(domain, selector string, key *rsa.PrivateKey) (*Signer, error) {
 		// actually present. We separately require exactly one From field,
 		// as RFC 6376 requires From to be signed.
 	}}, nil
+}
+
+// Domain returns the signing domain encoded in the DKIM-Signature.
+func (s *Signer) Domain() string {
+	if s == nil {
+		return ""
+	}
+	return s.options.Domain
+}
+
+// Selector returns the selector encoded in the DKIM-Signature.
+func (s *Signer) Selector() string {
+	if s == nil {
+		return ""
+	}
+	return s.options.Selector
+}
+
+// DNSRecord returns the TXT value that publishes this signer's RSA public key.
+func (s *Signer) DNSRecord() (string, error) {
+	if s == nil || s.options.Signer == nil {
+		return "", errors.New("DKIM signer is not configured")
+	}
+	publicKey, ok := s.options.Signer.Public().(*rsa.PublicKey)
+	if !ok || publicKey == nil {
+		return "", errors.New("DKIM signer does not contain an RSA public key")
+	}
+	encoded := base64.StdEncoding.EncodeToString(x509.MarshalPKCS1PublicKey(publicKey))
+	return "v=DKIM1; k=rsa; p=" + encoded, nil
 }
 
 // LoadRSAPrivateKey loads an unencrypted PKCS#1 or PKCS#8 RSA private key.

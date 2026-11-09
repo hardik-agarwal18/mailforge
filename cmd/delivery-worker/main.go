@@ -14,6 +14,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"mailforge/internal/bounce"
 	"mailforge/internal/database"
 	"mailforge/internal/delivery"
 	"mailforge/internal/dkimsign"
@@ -102,9 +103,30 @@ func run() error {
 	}
 	// Validate and load DKIM credentials before opening database/Redis
 	// connections so incomplete or invalid signing configuration fails fast.
-	dkimSigner, err := loadDKIMSignerFromEnv()
+	dkimSigner, dkimManager, err := loadDKIMSignerFromEnv()
 	if err != nil {
 		return err
+	}
+	bounceGenerator, err := loadBounceGeneratorFromEnv()
+	if err != nil {
+		return err
+	}
+	if bounceGenerator != nil {
+		log.Printf("Recipient-specific DSN return-path enabled: domain=%s", bounceGenerator.Domain())
+	} else {
+		log.Println("WARNING: DSN VERP return-path disabled; remote bounces cannot be correlated")
+	}
+	if dkimManager != nil {
+		go dkimManager.Watch(ctx, 5*time.Second)
+		log.Printf("Outbound DKIM hot rotation enabled: domain=%s selector=%s", dkimManager.Domain(), dkimManager.Selector())
+	} else if dkimSigner != nil {
+		identity := dkimSigner.(interface {
+			Domain() string
+			Selector() string
+		})
+		log.Printf("Outbound DKIM signing enabled: domain=%s selector=%s", identity.Domain(), identity.Selector())
+	} else {
+		log.Println("Outbound DKIM signing disabled")
 	}
 
 	defaultRetryPolicy := delivery.DefaultRetryPolicy()
@@ -263,11 +285,6 @@ func run() error {
 		RequireSTARTTLS:  strings.EqualFold(os.Getenv("SMTP_REQUIRE_STARTTLS"), "true"),
 	}
 	smtpConfig.DKIMSigner = dkimSigner
-	if dkimSigner != nil {
-		log.Printf("Outbound DKIM signing enabled: domain=%s selector=%s", strings.TrimSpace(os.Getenv("SMTP_DKIM_DOMAIN")), strings.TrimSpace(os.Getenv("SMTP_DKIM_SELECTOR")))
-	} else {
-		log.Println("Outbound DKIM signing disabled")
-	}
 
 	var smtpClient *outbound.Client
 
@@ -367,6 +384,9 @@ func run() error {
 		smtpClient,
 		metrics,
 	)
+	if bounceGenerator != nil {
+		processor.SetBounceAddressGenerator(bounceGenerator)
+	}
 
 	// --------------------------------------------------
 	// Delivery worker
@@ -415,33 +435,63 @@ func run() error {
 	return nil
 }
 
-func loadDKIMSignerFromEnv() (*dkimsign.Signer, error) {
+func loadDKIMSignerFromEnv() (dkimsign.MessageSigner, *dkimsign.KeyManager, error) {
+	keysetPath := strings.TrimSpace(os.Getenv("SMTP_DKIM_KEYSET_FILE"))
 	domain := strings.TrimSpace(os.Getenv("SMTP_DKIM_DOMAIN"))
 	selector := strings.TrimSpace(os.Getenv("SMTP_DKIM_SELECTOR"))
 	keyPath := strings.TrimSpace(os.Getenv("SMTP_DKIM_PRIVATE_KEY_FILE"))
 
-	configured := 0
+	legacyConfigured := 0
 	for _, value := range []string{domain, selector, keyPath} {
 		if value != "" {
-			configured++
+			legacyConfigured++
 		}
 	}
-	if configured == 0 {
-		return nil, nil
+	if keysetPath != "" {
+		if legacyConfigured != 0 {
+			return nil, nil, fmt.Errorf("use SMTP_DKIM_KEYSET_FILE or the legacy SMTP_DKIM_DOMAIN/SELECTOR/PRIVATE_KEY_FILE settings, not both")
+		}
+		manager, err := dkimsign.NewKeyManager(keysetPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("load DKIM keyset: %w", err)
+		}
+		return manager, manager, nil
 	}
-	if configured != 3 {
-		return nil, fmt.Errorf("DKIM configuration is incomplete: set SMTP_DKIM_DOMAIN, SMTP_DKIM_SELECTOR, and SMTP_DKIM_PRIVATE_KEY_FILE together")
+	if legacyConfigured == 0 {
+		return nil, nil, nil
 	}
-
+	if legacyConfigured != 3 {
+		return nil, nil, fmt.Errorf("DKIM configuration is incomplete: set SMTP_DKIM_DOMAIN, SMTP_DKIM_SELECTOR, and SMTP_DKIM_PRIVATE_KEY_FILE together")
+	}
 	key, err := dkimsign.LoadRSAPrivateKey(keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("load outbound DKIM key: %w", err)
+		return nil, nil, fmt.Errorf("load outbound DKIM key: %w", err)
 	}
 	signer, err := dkimsign.NewSigner(domain, selector, key)
 	if err != nil {
-		return nil, fmt.Errorf("configure outbound DKIM signer: %w", err)
+		return nil, nil, fmt.Errorf("configure outbound DKIM signer: %w", err)
 	}
-	return signer, nil
+	return signer, nil, nil
+}
+
+func loadBounceGeneratorFromEnv() (*bounce.Generator, error) {
+	domain := strings.TrimSpace(os.Getenv("SMTP_BOUNCE_DOMAIN"))
+	secret := strings.TrimSpace(os.Getenv("SMTP_BOUNCE_HMAC_SECRET"))
+	if domain == "" && secret == "" {
+		return nil, nil
+	}
+	if domain == "" || secret == "" {
+		return nil, fmt.Errorf("bounce configuration is incomplete: set SMTP_BOUNCE_DOMAIN and SMTP_BOUNCE_HMAC_SECRET together")
+	}
+	key, err := bounce.DecodeHexKey(secret)
+	if err != nil {
+		return nil, err
+	}
+	generator, err := bounce.NewGenerator(domain, key)
+	if err != nil {
+		return nil, err
+	}
+	return generator, nil
 }
 
 // --------------------------------------------------

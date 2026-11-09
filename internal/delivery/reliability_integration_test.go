@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"mailforge/internal/bounce"
 	"mailforge/internal/outbound"
 )
 
@@ -353,6 +354,118 @@ func (s *integrationSender) Send(ctx context.Context, _, _ string, _ []byte) err
 		}
 	}
 	return s.sendErr
+}
+
+func TestIntegrationProcessDSNIsIdempotentAndSuppressesHardBounce(t *testing.T) {
+	db := integrationPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	recipientID, _ := integrationCreateRecipient(t, ctx, db)
+	generator, err := bounce.NewGenerator("bounces.example.test", []byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verp, err := generator.AddressForRecipient(recipientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := []byte("From: Mail Delivery Subsystem <mailer-daemon@example.net>\r\n" +
+		"Message-ID: <dsn-test@example.net>\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/report; report-type=delivery-status; boundary=dsn-test\r\n\r\n" +
+		"--dsn-test\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nDelivery failed.\r\n" +
+		"--dsn-test\r\nContent-Type: message/delivery-status\r\n\r\n" +
+		"Reporting-MTA: dns; mx.example.net\r\n\r\n" +
+		"Final-Recipient: rfc822; recipient@example.test\r\n" +
+		"Action: failed\r\nStatus: 5.1.1\r\n" +
+		"Diagnostic-Code: smtp; 550 5.1.1 user unknown\r\n\r\n" +
+		"--dsn-test--\r\n")
+
+	repository := NewRepository(db)
+	first, err := repository.ProcessDSN(ctx, generator, verp, report)
+	if err != nil {
+		t.Fatalf("ProcessDSN: %v", err)
+	}
+	if first.Duplicate || !first.Suppressed || first.Action != "failed" {
+		t.Fatalf("first DSN result = %#v", first)
+	}
+
+	duplicate, err := repository.ProcessDSN(ctx, generator, verp, report)
+	if err != nil {
+		t.Fatalf("ProcessDSN duplicate: %v", err)
+	}
+	if !duplicate.Duplicate {
+		t.Fatalf("duplicate result = %#v", duplicate)
+	}
+
+	// The same raw DSN body can legitimately be received for a second
+	// send to the same mailbox. Idempotency must be scoped to recipient ID,
+	// not globally to the raw report hash.
+	secondRecipientID, _ := integrationCreateRecipient(t, ctx, db)
+	secondVERP, err := generator.AddressForRecipient(secondRecipientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDelivery, err := repository.ProcessDSN(ctx, generator, secondVERP, report)
+	if err != nil {
+		t.Fatalf("ProcessDSN for second delivery with identical report bytes: %v", err)
+	}
+	if secondDelivery.Duplicate || !secondDelivery.Suppressed {
+		t.Fatalf("second delivery result = %#v, want distinct processed report", secondDelivery)
+	}
+	var processedReports int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM processed_dsn_reports WHERE final_recipient = 'recipient@example.test'`).Scan(&processedReports); err != nil {
+		t.Fatal(err)
+	}
+	if processedReports != 2 {
+		t.Fatalf("processed DSN report rows = %d, want 2 per-recipient rows", processedReports)
+	}
+
+	var status string
+	if err := db.QueryRow(ctx, `SELECT status FROM recipients WHERE id = $1::uuid`, recipientID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "bounced" {
+		t.Fatalf("recipient status = %s, want bounced", status)
+	}
+	var suppressions int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM recipient_suppressions WHERE mailbox_key = 'recipient@example.test'`).Scan(&suppressions); err != nil {
+		t.Fatal(err)
+	}
+	if suppressions != 1 {
+		t.Fatalf("suppression rows = %d, want 1", suppressions)
+	}
+
+	// Any message submitted after the hard bounce is blocked at claim time,
+	// even if it already has an outbox event.
+	var messageUUID string
+	if err := db.QueryRow(ctx, `
+		INSERT INTO messages (message_id, envelope_sender, raw_message, message_size)
+		VALUES ($1, 'sender@example.test', $2, 40) RETURNING id::text
+	`, fmt.Sprintf("<%s@example.test>", uuid.NewString()), []byte("From: sender@example.test\r\n\r\nHi")).Scan(&messageUUID); err != nil {
+		t.Fatal(err)
+	}
+	var blockedID string
+	if err := db.QueryRow(ctx, `
+		INSERT INTO recipients (message_id, email, status, next_attempt_at)
+		VALUES ($1::uuid, 'recipient@example.test', 'pending', NOW()) RETURNING id::text
+	`, messageUUID).Scan(&blockedID); err != nil {
+		t.Fatal(err)
+	}
+	job, err := repository.ClaimRecipient(ctx, blockedID)
+	if err != nil {
+		t.Fatalf("ClaimRecipient for suppressed address: %v", err)
+	}
+	if job != nil {
+		t.Fatal("suppressed recipient was claimed for SMTP delivery")
+	}
+	if err := db.QueryRow(ctx, `SELECT status FROM recipients WHERE id = $1::uuid`, blockedID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "suppressed" {
+		t.Fatalf("new recipient status = %s, want suppressed", status)
+	}
 }
 
 func integrationCreateRecipient(

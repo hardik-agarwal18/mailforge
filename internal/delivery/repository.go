@@ -72,6 +72,20 @@ func (r *Repository) ClaimRecipient(
 	}
 	defer tx.Rollback(context.Background())
 
+	// Apply a durable suppression decision before attempting SMTP. This is
+	// checked at claim time so addresses suppressed after message submission
+	// are still blocked from later queued delivery attempts.
+	suppressed, err := r.suppressRecipientIfNeeded(ctx, tx, recipientID)
+	if err != nil {
+		return nil, err
+	}
+	if suppressed {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("commit recipient suppression: %w", err)
+		}
+		return nil, nil
+	}
+
 	var job ClaimedDelivery
 	var previousStatus string
 
@@ -163,7 +177,7 @@ func (r *Repository) ClaimRecipient(
 		}
 
 		switch status {
-		case "delivered", "bounced", "unknown":
+		case "delivered", "bounced", "unknown", "suppressed":
 			// Terminal automatic-delivery states. In particular, unknown requires
 			// reconciliation before an operator may choose to retry it.
 			return nil, nil
@@ -245,6 +259,66 @@ func (r *Repository) ClaimRecipient(
 	}
 
 	return &job, nil
+}
+
+func (r *Repository) suppressRecipientIfNeeded(ctx context.Context, tx pgx.Tx, recipientID string) (bool, error) {
+	var email, status string
+	err := tx.QueryRow(ctx, `
+		SELECT email, status
+		FROM recipients
+		WHERE id = $1::uuid
+		FOR UPDATE
+	`, recipientID).Scan(&email, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrRecipientNotFound
+	}
+	if err != nil {
+		return false, fmt.Errorf("load recipient before suppression check: %w", err)
+	}
+	if status != "pending" && status != "deferred" {
+		return false, nil
+	}
+
+	key, err := SuppressionKey(email)
+	if err != nil {
+		return false, fmt.Errorf("normalize recipient for suppression check: %w", err)
+	}
+	var reason string
+	err = tx.QueryRow(ctx, `
+		SELECT reason
+		FROM recipient_suppressions
+		WHERE mailbox_key = $1
+	`, key).Scan(&reason)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check recipient suppression: %w", err)
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE recipients
+		SET status = 'suppressed', next_attempt_at = NULL,
+		    delivery_lease_until = NULL, delivery_lease_token = NULL,
+		    last_error = $2, updated_at = NOW()
+		WHERE id = $1::uuid AND status IN ('pending', 'deferred')
+	`, recipientID, "Recipient suppressed by "+reason+" policy")
+	if err != nil {
+		return false, fmt.Errorf("mark recipient suppressed: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return false, fmt.Errorf("recipient %s changed during suppression check", recipientID)
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO delivery_status_events (
+			recipient_id, from_status, to_status, event_type, diagnostic
+		)
+		VALUES ($1::uuid, $2, 'suppressed', 'suppressed', $3)
+	`, recipientID, status, "Delivery blocked by "+reason+" suppression")
+	if err != nil {
+		return false, fmt.Errorf("record recipient suppression event: %w", err)
+	}
+	return true, nil
 }
 
 // markExpiredDeliveryUnknown durably reconciles an abandoned SMTP attempt.

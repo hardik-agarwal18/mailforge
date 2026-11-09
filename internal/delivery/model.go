@@ -23,22 +23,23 @@ type ClaimedDelivery struct {
 
 // RecipientDeliveryStatus is the current durable state for one envelope recipient.
 type RecipientDeliveryStatus struct {
-	RecipientID        string
-	MessageID          string
-	Email              string
-	Status             string
-	Attempts           int
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
-	NextAttemptAt      *time.Time
-	LastAttemptAt      *time.Time
-	DeliveredAt        *time.Time
-	BouncedAt          *time.Time
-	UnknownAt          *time.Time
-	LastSMTPCode       *int
-	LastEnhancedStatus string
-	LastSMTPStage      string
-	LastError          string
+	RecipientID              string
+	MessageID                string
+	Email                    string
+	Status                   string
+	Attempts                 int
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+	NextAttemptAt            *time.Time
+	LastAttemptAt            *time.Time
+	DeliveredAt              *time.Time
+	BouncedAt                *time.Time
+	UnknownAt                *time.Time
+	FinalDeliveryConfirmedAt *time.Time
+	LastSMTPCode             *int
+	LastEnhancedStatus       string
+	LastSMTPStage            string
+	LastError                string
 }
 
 // DeliveryStatusEvent is one immutable transition in a recipient's lifecycle.
@@ -70,4 +71,5 @@ type MessageDeliverySummary struct {
 	Delivered  int
 	Bounced    int
 	Unknown    int
+	Suppressed int
 }

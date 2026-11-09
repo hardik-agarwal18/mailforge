@@ -18,9 +18,10 @@ const (
 )
 
 type Processor struct {
-	repository *Repository
-	sender     Sender
-	metrics    *observability.Metrics
+	repository             *Repository
+	sender                 Sender
+	metrics                *observability.Metrics
+	bounceAddressGenerator BounceAddressGenerator
 }
 
 func NewProcessor(
@@ -38,6 +39,12 @@ func NewProcessor(
 	}
 
 	return processor
+}
+
+// SetBounceAddressGenerator configures recipient-specific VERP MAIL FROM
+// addresses. Call it before starting the worker goroutines.
+func (p *Processor) SetBounceAddressGenerator(generator BounceAddressGenerator) {
+	p.bounceAddressGenerator = generator
 }
 
 func (p *Processor) Process(
@@ -59,6 +66,14 @@ func (p *Processor) Process(
 			event.EventID,
 		)
 		return nil
+	}
+
+	envelopeSender := job.Sender
+	if p.bounceAddressGenerator != nil {
+		envelopeSender, err = p.bounceAddressGenerator.AddressForRecipient(job.RecipientID)
+		if err != nil {
+			return fmt.Errorf("generate recipient VERP return-path: %w", err)
+		}
 	}
 
 	// The outbound SMTP client owns the configured SMTP_DELIVERY_TIMEOUT.
@@ -93,14 +108,14 @@ func (p *Processor) Process(
 	if detailedSender, ok := p.sender.(DetailedSender); ok {
 		transportInfo, sendErr = detailedSender.SendWithResult(
 			deliveryCtx,
-			job.Sender,
+			envelopeSender,
 			job.Email,
 			job.RawMessage,
 		)
 	} else {
 		sendErr = p.sender.Send(
 			deliveryCtx,
-			job.Sender,
+			envelopeSender,
 			job.Email,
 			job.RawMessage,
 		)

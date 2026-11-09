@@ -505,7 +505,6 @@ func TestSMTPTransactionDeliversEachUniqueRecipientOnce(t *testing.T) {
 	acceptor := &testAcceptor{}
 	server := NewServer("127.0.0.1:0", acceptor, nil)
 	server.limits = normalizeServerLimits(ServerLimits{MaxRecipients: 3})
-
 	serverConn, clientConn := net.Pipe()
 	done := make(chan struct{})
 	go func() {

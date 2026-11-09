@@ -6,6 +6,10 @@ import (
 	"mailforge/internal/outbound"
 )
 
+type BounceAddressGenerator interface {
+	AddressForRecipient(recipientID string) (string, error)
+}
+
 type Sender interface {
 	Send(
 		ctx context.Context,

@@ -16,7 +16,7 @@ func (r *Repository) GetRecipientDeliveryStatus(
 	recipientID string,
 ) (*RecipientDeliveryStatus, error) {
 	var status RecipientDeliveryStatus
-	var nextAttemptAt, lastAttemptAt, deliveredAt, bouncedAt, unknownAt pgtype.Timestamptz
+	var nextAttemptAt, lastAttemptAt, deliveredAt, bouncedAt, unknownAt, finalDeliveryConfirmedAt pgtype.Timestamptz
 	var lastSMTPCode pgtype.Int4
 	var enhancedStatus, smtpStage, lastError pgtype.Text
 
@@ -34,6 +34,7 @@ func (r *Repository) GetRecipientDeliveryStatus(
 			r.delivered_at,
 			r.bounced_at,
 			r.unknown_at,
+			r.final_delivery_confirmed_at,
 			r.last_smtp_code,
 			r.last_enhanced_status_code,
 			r.last_smtp_stage,
@@ -53,6 +54,7 @@ func (r *Repository) GetRecipientDeliveryStatus(
 		&deliveredAt,
 		&bouncedAt,
 		&unknownAt,
+		&finalDeliveryConfirmedAt,
 		&lastSMTPCode,
 		&enhancedStatus,
 		&smtpStage,
@@ -70,6 +72,7 @@ func (r *Repository) GetRecipientDeliveryStatus(
 	status.DeliveredAt = nullableTimestamp(deliveredAt)
 	status.BouncedAt = nullableTimestamp(bouncedAt)
 	status.UnknownAt = nullableTimestamp(unknownAt)
+	status.FinalDeliveryConfirmedAt = nullableTimestamp(finalDeliveryConfirmedAt)
 	if lastSMTPCode.Valid {
 		code := int(lastSMTPCode.Int32)
 		status.LastSMTPCode = &code
@@ -209,7 +212,8 @@ func (r *Repository) GetMessageDeliverySummary(
 			COUNT(*) FILTER (WHERE status = 'deferred')::integer,
 			COUNT(*) FILTER (WHERE status = 'delivered')::integer,
 			COUNT(*) FILTER (WHERE status = 'bounced')::integer,
-			COUNT(*) FILTER (WHERE status = 'unknown')::integer
+			COUNT(*) FILTER (WHERE status = 'unknown')::integer,
+			COUNT(*) FILTER (WHERE status = 'suppressed')::integer
 		FROM recipients
 		WHERE message_id = $1::uuid
 		GROUP BY message_id
@@ -222,6 +226,7 @@ func (r *Repository) GetMessageDeliverySummary(
 		&summary.Delivered,
 		&summary.Bounced,
 		&summary.Unknown,
+		&summary.Suppressed,
 	)
 	if err != nil {
 		if err == pgx.ErrNoRows {
