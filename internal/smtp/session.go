@@ -19,11 +19,11 @@ type Session struct {
 	ESMTP     bool
 	TLSActive bool
 
-	Authenticated         bool
-	AuthenticatedUsername string
-	AuthenticatedEmail    string
-	AuthorizedDomains     []string
-	AuthFailures          int
+	Authenticated             bool
+	AuthenticatedCredentialID string
+	AuthenticatedEmail        string
+	AuthorizedDomains         []string
+	AuthFailures              int
 
 	Sender      string
 	Recipients  []string

@@ -61,7 +61,10 @@ func (r *Repository) Create(
 	// Quota reservations share this transaction with message persistence. A
 	// rejected submission rolls back both counters and all message records.
 	recipientCount := len(msg.Recipients)
-	if account := strings.ToLower(strings.TrimSpace(msg.Sender)); account != "" &&
+	// Account quotas belong to the authenticated SMTP credential, not the
+	// envelope sender. A credential may legitimately send as verified aliases;
+	// using msg.Sender here would let it spread usage across multiple aliases.
+	if account := submissionQuotaAccountID(msg); account != "" &&
 		(r.quotas.MaxMessagesPerAccountPerHour > 0 || r.quotas.MaxRecipientsPerAccountPerHour > 0) {
 		if err := r.reserveSubmissionQuota(
 			ctx, tx, "account", quotaIdentity(account),

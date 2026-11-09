@@ -133,6 +133,7 @@ func (r *Repository) Authenticate(
 	}
 
 	return smtp.Identity{
+		CredentialID:      credentialID,
 		Username:          username,
 		Email:             email,
 		AuthorizedDomains: authorizedDomains,

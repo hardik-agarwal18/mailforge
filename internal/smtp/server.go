@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"mailforge/internal/emailaddr"
 	"mailforge/internal/message"
 )
@@ -314,7 +316,7 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 			session.ESMTP = false
 			session.TLSActive = true
 			session.Authenticated = false
-			session.AuthenticatedUsername = ""
+			session.AuthenticatedCredentialID = ""
 			session.AuthenticatedEmail = ""
 			session.AuthorizedDomains = nil
 
@@ -404,7 +406,8 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 				continue
 			}
 
-			if identity.Username == "" || emailaddr.ValidateMailbox(identity.Email) != nil {
+			if _, credentialIDErr := uuid.Parse(identity.CredentialID); credentialIDErr != nil ||
+				identity.Username == "" || emailaddr.ValidateMailbox(identity.Email) != nil {
 				log.Printf("SMTP authenticator returned an incomplete or invalid identity")
 				_ = writeReply(conn, "454 4.7.0 Temporary authentication failure")
 				continue
@@ -414,7 +417,7 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 				s.metrics.RecordAuthentication(true)
 			}
 			session.Authenticated = true
-			session.AuthenticatedUsername = identity.Username
+			session.AuthenticatedCredentialID = identity.CredentialID
 			session.AuthenticatedEmail = identity.Email
 			session.AuthorizedDomains = append([]string(nil), identity.AuthorizedDomains...)
 			_ = writeReply(conn, "235 2.7.0 Authentication successful")
@@ -515,9 +518,11 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 			if s.submission {
 				clientIP = remoteIP(conn)
 			}
+			authenticatedCredentialID := ""
 			authenticatedEmail := ""
 			var authorizedDomains []string
 			if s.submission {
+				authenticatedCredentialID = session.AuthenticatedCredentialID
 				authenticatedEmail = session.AuthenticatedEmail
 				authorizedDomains = append([]string(nil), session.AuthorizedDomains...)
 			}
@@ -525,12 +530,13 @@ func (s *Server) handleConnectionContext(ctx context.Context, conn net.Conn) {
 			stored, err := s.messageAcceptor.Accept(
 				acceptCtx,
 				message.NewMessage{
-					Sender:             session.Sender,
-					AuthenticatedEmail: authenticatedEmail,
-					AuthorizedDomains:  authorizedDomains,
-					ClientIP:           clientIP,
-					Recipients:         session.Recipients,
-					RawMessage:         session.MessageData,
+					Sender:                    session.Sender,
+					AuthenticatedCredentialID: authenticatedCredentialID,
+					AuthenticatedEmail:        authenticatedEmail,
+					AuthorizedDomains:         authorizedDomains,
+					ClientIP:                  clientIP,
+					Recipients:                session.Recipients,
+					RawMessage:                session.MessageData,
 				},
 			)
 			cancel()

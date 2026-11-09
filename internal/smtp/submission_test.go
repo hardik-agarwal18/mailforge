@@ -47,6 +47,7 @@ func (testAuthenticator) Authenticate(_ context.Context, username, password stri
 		return Identity{}, ErrInvalidCredentials
 	}
 	return Identity{
+		CredentialID:      "00000000-0000-4000-8000-000000000001",
 		Username:          "hardik",
 		Email:             "sender@example.com",
 		AuthorizedDomains: []string{"verified.example.org"},
@@ -271,6 +272,9 @@ func TestSubmissionRequiresTLSAndAuthenticationAndBindsSender(t *testing.T) {
 	}
 	if acceptor.input.Sender != "sender@example.com" {
 		t.Fatalf("stored envelope sender = %q", acceptor.input.Sender)
+	}
+	if acceptor.input.AuthenticatedCredentialID != "00000000-0000-4000-8000-000000000001" {
+		t.Fatalf("authenticated credential ID = %q, want test credential UUID", acceptor.input.AuthenticatedCredentialID)
 	}
 	if acceptor.input.AuthenticatedEmail != "sender@example.com" {
 		t.Fatalf("authenticated submission identity = %q, want sender@example.com", acceptor.input.AuthenticatedEmail)

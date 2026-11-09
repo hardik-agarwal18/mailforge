@@ -1,5 +1,7 @@
 package message
 
+import "strings"
+
 // SubmissionQuotaLimits are enforced transactionally by the PostgreSQL
 // repository, so all SMTP submission replicas share the same hourly quotas.
 type SubmissionQuotaLimits struct {
@@ -33,4 +35,12 @@ func normalizeSubmissionQuotaLimits(limits SubmissionQuotaLimits) SubmissionQuot
 		limits.MaxRecipientsPerIPPerHour = defaults.MaxRecipientsPerIPPerHour
 	}
 	return limits
+}
+
+// submissionQuotaAccountID returns the canonical SMTP credential UUID that owns
+// a submission quota. Envelope senders, usernames and email addresses are not
+// stable account keys. An empty result means the message was not submitted
+// through authenticated SMTP and must not consume an account quota.
+func submissionQuotaAccountID(msg StoredMessage) string {
+	return strings.ToLower(strings.TrimSpace(msg.SubmissionAccountID))
 }

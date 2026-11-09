@@ -299,10 +299,11 @@ func TestAcceptEnforcesAuthenticatedSubmissionIdentity(t *testing.T) {
 			creator := &recordingCreator{}
 			service := NewService(creator)
 			_, err := service.Accept(context.Background(), NewMessage{
-				Sender:             test.envelopeFrom,
-				AuthenticatedEmail: "sender@example.com",
-				Recipients:         []string{"recipient@example.net"},
-				RawMessage:         []byte(test.message),
+				Sender:                    test.envelopeFrom,
+				AuthenticatedCredentialID: "00000000-0000-4000-8000-000000000002",
+				AuthenticatedEmail:        "sender@example.com",
+				Recipients:                []string{"recipient@example.net"},
+				RawMessage:                []byte(test.message),
 			})
 
 			if test.wantErr != nil {
@@ -329,10 +330,11 @@ func TestAcceptAllowsVerifiedSendingDomain(t *testing.T) {
 	creator := &recordingCreator{}
 	service := NewService(creator)
 	_, err := service.Accept(context.Background(), NewMessage{
-		Sender:             "billing@verified.example.org",
-		AuthenticatedEmail: "sender@example.com",
-		AuthorizedDomains:  []string{"verified.example.org"},
-		Recipients:         []string{"recipient@example.net"},
+		Sender:                    "billing@verified.example.org",
+		AuthenticatedCredentialID: "00000000-0000-4000-8000-000000000002",
+		AuthenticatedEmail:        "sender@example.com",
+		AuthorizedDomains:         []string{"verified.example.org"},
+		Recipients:                []string{"recipient@example.net"},
 		RawMessage: []byte("From: Billing <billing@VERIFIED.example.org>\r\n" +
 			"Sender: billing@verified.example.org\r\n" +
 			"To: recipient@example.net\r\n\r\nhello\r\n"),
@@ -343,16 +345,74 @@ func TestAcceptAllowsVerifiedSendingDomain(t *testing.T) {
 	if creator.calls != 1 {
 		t.Fatalf("repository Create calls = %d, want 1", creator.calls)
 	}
+	if creator.msg.SubmissionAccountID != "00000000-0000-4000-8000-000000000002" {
+		t.Fatalf("submission account = %q, want authenticated credential UUID", creator.msg.SubmissionAccountID)
+	}
+}
+
+func TestAcceptRejectsAuthenticatedSubmissionWithoutCredentialID(t *testing.T) {
+	creator := &recordingCreator{}
+	service := NewService(creator)
+
+	_, err := service.Accept(context.Background(), NewMessage{
+		Sender:             "sender@example.com",
+		AuthenticatedEmail: "sender@example.com",
+		Recipients:         []string{"recipient@example.net"},
+		RawMessage:         []byte("From: sender@example.com\r\n\r\nhello\r\n"),
+	})
+	if !errors.Is(err, ErrUnauthorizedSubmissionIdentity) {
+		t.Fatalf("Accept() error = %v, want ErrUnauthorizedSubmissionIdentity", err)
+	}
+	if creator.calls != 0 {
+		t.Fatalf("repository Create called %d times without a credential ID, want 0", creator.calls)
+	}
+}
+
+func TestAcceptRejectsMalformedAuthenticatedCredentialID(t *testing.T) {
+	creator := &recordingCreator{}
+	service := NewService(creator)
+
+	_, err := service.Accept(context.Background(), NewMessage{
+		Sender:                    "sender@example.com",
+		AuthenticatedCredentialID: "not-a-uuid",
+		AuthenticatedEmail:        "sender@example.com",
+		Recipients:                []string{"recipient@example.net"},
+		RawMessage:                []byte("From: sender@example.com\r\n\r\nhello\r\n"),
+	})
+	if !errors.Is(err, ErrUnauthorizedSubmissionIdentity) {
+		t.Fatalf("Accept() error = %v, want ErrUnauthorizedSubmissionIdentity", err)
+	}
+	if creator.calls != 0 {
+		t.Fatalf("repository Create called %d times with malformed credential ID, want 0", creator.calls)
+	}
+}
+
+func TestAcceptDoesNotSetSubmissionAccountIDForUnauthenticatedMessage(t *testing.T) {
+	creator := &recordingCreator{}
+	service := NewService(creator)
+
+	_, err := service.Accept(context.Background(), NewMessage{
+		Sender:     "remote-sender@example.net",
+		Recipients: []string{"recipient@example.com"},
+		RawMessage: []byte("From: remote-sender@example.net\r\n\r\nhello\r\n"),
+	})
+	if err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	if creator.msg.SubmissionAccountID != "" {
+		t.Fatalf("unauthenticated message submission account = %q, want empty", creator.msg.SubmissionAccountID)
+	}
 }
 
 func TestAcceptRejectsUnverifiedDomainEvenWhenPrimaryDomainMatches(t *testing.T) {
 	creator := &recordingCreator{}
 	service := NewService(creator)
 	_, err := service.Accept(context.Background(), NewMessage{
-		Sender:             "alias@example.com",
-		AuthenticatedEmail: "sender@example.com",
-		Recipients:         []string{"recipient@example.net"},
-		RawMessage:         []byte("From: alias@example.com\r\n\r\nhello\r\n"),
+		Sender:                    "alias@example.com",
+		AuthenticatedCredentialID: "00000000-0000-4000-8000-000000000002",
+		AuthenticatedEmail:        "sender@example.com",
+		Recipients:                []string{"recipient@example.net"},
+		RawMessage:                []byte("From: alias@example.com\r\n\r\nhello\r\n"),
 	})
 	if !errors.Is(err, ErrUnauthorizedSubmissionIdentity) {
 		t.Fatalf("Accept() error = %v, want ErrUnauthorizedSubmissionIdentity", err)

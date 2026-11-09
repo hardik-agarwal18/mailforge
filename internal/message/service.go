@@ -88,7 +88,11 @@ func (s *Service) Accept(
 	// DNS-verified sending domain for the envelope and visible author fields.
 	// Ordinary inbound SMTP leaves AuthenticatedEmail empty and is intentionally
 	// exempt because remote sender authenticity is a separate mail-auth concern.
-	if input.AuthenticatedEmail != "" {
+	authenticatedSubmission := input.AuthenticatedCredentialID != "" || input.AuthenticatedEmail != ""
+	if authenticatedSubmission {
+		if _, err := uuid.Parse(input.AuthenticatedCredentialID); err != nil {
+			return StoredMessage{}, fmt.Errorf("%w: authenticated credential ID is missing or invalid", ErrUnauthorizedSubmissionIdentity)
+		}
 		if err := validateAuthenticatedSubmissionIdentity(input.AuthenticatedEmail, input.AuthorizedDomains, input.Sender, parsed); err != nil {
 			return StoredMessage{}, err
 		}
@@ -103,6 +107,12 @@ func (s *Service) Accept(
 		Parsed:      parsed,
 		MessageSize: int64(len(input.RawMessage)),
 		CreatedAt:   time.Now().UTC(),
+	}
+	if authenticatedSubmission {
+		// The authenticated credential owns the quota even when it sends from
+		// one of its verified domain aliases. Use the credential's immutable
+		// database ID, not its sender address, username or email address.
+		stored.SubmissionAccountID = input.AuthenticatedCredentialID
 	}
 
 	id, err := s.repository.Create(ctx, stored)

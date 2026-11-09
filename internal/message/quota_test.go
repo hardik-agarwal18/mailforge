@@ -20,3 +20,30 @@ func TestQuotaIdentityDoesNotExposeInput(t *testing.T) {
 		t.Fatal("quota identity must be deterministic")
 	}
 }
+
+func TestSubmissionQuotaAccountUsesCredentialIDNotEnvelopeSender(t *testing.T) {
+	first := StoredMessage{
+		Sender:              "billing@verified.example.org",
+		SubmissionAccountID: "00000000-0000-4000-8000-00000000000A",
+	}
+	second := StoredMessage{
+		Sender:              "notices@verified.example.org",
+		SubmissionAccountID: "00000000-0000-4000-8000-00000000000a",
+	}
+
+	firstAccount := submissionQuotaAccountID(first)
+	secondAccount := submissionQuotaAccountID(second)
+	if firstAccount != "00000000-0000-4000-8000-00000000000a" {
+		t.Fatalf("submission quota account = %q, want normalized authenticated credential UUID", firstAccount)
+	}
+	if firstAccount != secondAccount {
+		t.Fatalf("different envelope aliases produced different quota accounts: %q != %q", firstAccount, secondAccount)
+	}
+}
+
+func TestUnauthenticatedMessageHasNoAccountQuotaIdentity(t *testing.T) {
+	got := submissionQuotaAccountID(StoredMessage{Sender: "remote-sender@example.net"})
+	if got != "" {
+		t.Fatalf("unauthenticated submission quota account = %q, want empty", got)
+	}
+}

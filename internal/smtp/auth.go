@@ -10,8 +10,9 @@ var ErrInvalidCredentials = errors.New("invalid SMTP credentials")
 
 // Identity is an authenticated submission identity and its authorized sender domains.
 type Identity struct {
-	Username string
-	Email    string
+	CredentialID string
+	Username     string
+	Email        string
 	// AuthorizedDomains contains only DNS-verified sending domains owned by
 	// this credential. The primary Email remains authorized independently.
 	AuthorizedDomains []string
