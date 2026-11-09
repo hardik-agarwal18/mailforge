@@ -15,10 +15,11 @@ import (
 	"mailforge/internal/database"
 	"mailforge/internal/message"
 	"mailforge/internal/observability"
-	"mailforge/internal/smtp"
-	"mailforge/internal/smtpauth"
+	"mailforge/internal/redisclient"
 
 	"github.com/redis/go-redis/v9"
+	"mailforge/internal/smtp"
+	"mailforge/internal/smtpauth"
 )
 
 func main() {
@@ -54,10 +55,8 @@ func main() {
 	}
 	defer pool.Close()
 
-	redisAddr := envString("REDIS_ADDR", "127.0.0.1:6379")
-	redisClient := redis.NewClient(&redis.Options{
-		Addr:         redisAddr,
-		Password:     os.Getenv("REDIS_PASSWORD"),
+	redisClient, err := redisclient.NewFromEnv(redis.Options{
+		Addr:         "127.0.0.1:6379",
 		DB:           0,
 		PoolSize:     20,
 		DialTimeout:  3 * time.Second,
@@ -65,6 +64,9 @@ func main() {
 		WriteTimeout: 3 * time.Second,
 		MaxRetries:   1,
 	})
+	if err != nil {
+		log.Fatalf("Redis configuration failed: %v", err)
+	}
 	defer func() {
 		if err := redisClient.Close(); err != nil {
 			log.Printf("Redis shutdown failed: %v", err)
@@ -84,7 +86,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("configure distributed SMTP authentication rate limiter: %v", err)
 	}
-	log.Printf("Distributed SMTP authentication rate limiting enabled via Redis at %s (fail-closed)", redisAddr)
+	log.Println("Distributed SMTP authentication rate limiting enabled via Redis (fail-closed)")
 
 	limits := smtp.DefaultServerLimits()
 	limits.MaxConnections = envInt("SMTP_MAX_CONNECTIONS", limits.MaxConnections)

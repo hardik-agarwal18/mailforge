@@ -96,7 +96,7 @@ Alertmanager routes local alert email to Mailpit in the sample configuration. In
 ### Redis unavailable
 
 1. Check the Redis container and its health.
-2. Check `REDIS_ADDR` and `REDIS_PASSWORD` for the publisher, submission server, and workers.
+2. Check Redis configuration for the publisher, submission server, and workers. For local Redis, use `REDIS_ADDR` and `REDIS_PASSWORD`. For a managed Redis provider such as Upstash, set `REDIS_URL` to its native TCP connection URL (`rediss://` enables TLS); `REDIS_URL` takes precedence over the local address/password variables.
 3. Restore Redis connectivity before restarting dependent processes.
 4. Confirm the PostgreSQL outbox still contains pending/publishing work; PostgreSQL remains the durable record of intent.
 5. Restart the publisher/worker processes and inspect queue/worker metrics.

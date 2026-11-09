@@ -14,19 +14,15 @@ import (
 	"mailforge/internal/database"
 	"mailforge/internal/observability"
 	"mailforge/internal/outbox"
+	"mailforge/internal/redisclient"
 
 	"github.com/redis/go-redis/v9"
 )
 
 func main() {
 	databaseURL := os.Getenv("DATABASE_URL")
-	redisAddr := os.Getenv("REDIS_ADDR")
-	redisPassword := os.Getenv("REDIS_PASSWORD")
 	if databaseURL == "" {
 		log.Fatal("DATABASE_URL is required")
-	}
-	if redisAddr == "" {
-		redisAddr = "127.0.0.1:6379"
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -44,14 +40,16 @@ func main() {
 	}
 	defer pool.Close()
 
-	redisClient := redis.NewClient(&redis.Options{
-		Addr:         redisAddr,
-		Password:     redisPassword,
+	redisClient, err := redisclient.NewFromEnv(redis.Options{
+		Addr:         "127.0.0.1:6379",
 		DB:           0,
 		PoolSize:     10,
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
 	})
+	if err != nil {
+		log.Fatal("Redis configuration failed:", err)
+	}
 	defer func() {
 		if err := redisClient.Close(); err != nil {
 			log.Printf("Redis shutdown failed: %v", err)

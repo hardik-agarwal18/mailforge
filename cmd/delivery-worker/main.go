@@ -12,14 +12,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/redis/go-redis/v9"
-
 	"mailforge/internal/bounce"
 	"mailforge/internal/database"
 	"mailforge/internal/delivery"
 	"mailforge/internal/dkimsign"
 	"mailforge/internal/observability"
 	"mailforge/internal/outbound"
+	"mailforge/internal/redisclient"
+
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -60,7 +61,6 @@ func run() error {
 		return fmt.Errorf("DATABASE_URL is required")
 	}
 
-	redisAddr := envString("REDIS_ADDR", defaultRedisAddr)
 	metricsAddr := envString("METRICS_ADDR", defaultMetricsAddr)
 
 	workerConcurrency, err := envInt(
@@ -179,13 +179,15 @@ func run() error {
 	// Redis
 	// --------------------------------------------------
 
-	redisClient := redis.NewClient(&redis.Options{
-		Addr:         redisAddr,
-		Password:     os.Getenv("REDIS_PASSWORD"),
+	redisClient, err := redisclient.NewFromEnv(redis.Options{
+		Addr:         defaultRedisAddr,
 		DB:           0,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 5 * time.Second,
 	})
+	if err != nil {
+		return fmt.Errorf("Redis configuration failed: %w", err)
+	}
 
 	defer func() {
 		if err := redisClient.Close(); err != nil {
@@ -197,7 +199,7 @@ func run() error {
 		return fmt.Errorf("Redis connection failed: %w", err)
 	}
 
-	log.Printf("Redis connected: %s", redisAddr)
+	log.Println("Redis connected")
 
 	// --------------------------------------------------
 	// Prometheus metrics server
