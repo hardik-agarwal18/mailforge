@@ -114,7 +114,7 @@ if [[ -n "${SMTP_TLS_CA_FILE:-}" && ! -f "$SMTP_TLS_CA_FILE" ]]; then
   exit 2
 fi
 
-worker_metrics_port_url="http://${worker_metrics_host}:${worker_metrics_port}/metrics"
+# worker_metrics_url is built from the validated loopback address above.
 
 # Find an available worker executable extension for Git Bash/Windows.
 worker_binary="bin/mailforge-delivery-worker.exe"
