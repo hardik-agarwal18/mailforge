@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -107,9 +108,14 @@ type latencySummary struct {
 type benchmarkReport struct {
 	RunID                  string                      `json:"run_id"`
 	StartedAt              time.Time                   `json:"started_at"`
+	GoVersion              string                      `json:"go_version"`
+	OperatingSystem        string                      `json:"operating_system"`
+	Architecture           string                      `json:"architecture"`
+	LogicalCPUCount        int                         `json:"logical_cpu_count"`
 	RecipientPattern       string                      `json:"recipient_pattern"`
 	Requested              int                         `json:"requested"`
 	SubmissionConcurrency  int                         `json:"submission_concurrency"`
+	AuthenticationParallel int                         `json:"authentication_parallelism"`
 	DeliveryWorkerCount    int                         `json:"delivery_worker_count_label"`
 	MessageBodyBytes       int                         `json:"message_body_bytes"`
 	MockDelay              string                      `json:"mock_delay"`
@@ -125,8 +131,8 @@ type benchmarkReport struct {
 	AuthenticationLatency  latencySummary              `json:"authentication_latency"`
 	SMTPTransactionLatency latencySummary              `json:"smtp_transaction_latency"`
 	Delivery               deliverySnapshot            `json:"delivery"`
-	DeliverySeconds        float64                     `json:"delivery_seconds"`
-	DeliveryRate           float64                     `json:"delivered_messages_per_second"`
+	BenchmarkSeconds       float64                     `json:"benchmark_seconds"`
+	EndToEndDeliveryRate   float64                     `json:"end_to_end_delivered_messages_per_second"`
 	EndToEndLatency        latencySummary              `json:"end_to_end_latency"`
 	MockSMTP               deliverybench.MockSMTPStats `json:"mock_smtp"`
 	MockTrafficObserved    bool                        `json:"mock_traffic_observed"`
@@ -264,12 +270,13 @@ func run() int {
 	fmt.Println("             MAILFORGE END-TO-END DELIVERY BENCHMARK")
 	fmt.Println("============================================================")
 	fmt.Printf("Run ID:                 %s\n", runID)
+	fmt.Printf("Runtime:                %s %s/%s logical CPUs=%d\n", runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.NumCPU())
 	fmt.Printf("Submission endpoint:    %s:%d (STARTTLS + AUTH)\n", cfg.SubmissionHost, cfg.SubmissionPort)
 	fmt.Printf("Mock SMTP receiver:     %s\n", mock.Addr())
 	fmt.Printf("Recipient pattern:      %s\n", pattern)
 	fmt.Printf("Messages:               %d\n", cfg.Total)
 	fmt.Printf("Submission sessions:    %d\n", cfg.Concurrency)
-	fmt.Printf("Delivery worker label:  %d\n", cfg.DeliveryWorkers)
+	fmt.Printf("Delivery worker concurrency label (does not control process): %d\n", cfg.DeliveryWorkers)
 	fmt.Printf("AUTH parallelism:       %d\n", cfg.AuthParallelism)
 	fmt.Printf("Message body size:      %d bytes\n", cfg.MessageBytes)
 	fmt.Printf("Mock DATA delay:        %s\n", cfg.MockDelay)
@@ -315,9 +322,14 @@ func run() int {
 	report := benchmarkReport{
 		RunID:                  runID,
 		StartedAt:              startedAt,
+		GoVersion:              runtime.Version(),
+		OperatingSystem:        runtime.GOOS,
+		Architecture:           runtime.GOARCH,
+		LogicalCPUCount:        runtime.NumCPU(),
 		RecipientPattern:       pattern,
 		Requested:              cfg.Total,
 		SubmissionConcurrency:  cfg.Concurrency,
+		AuthenticationParallel: cfg.AuthParallelism,
 		DeliveryWorkerCount:    cfg.DeliveryWorkers,
 		MessageBodyBytes:       cfg.MessageBytes,
 		MockDelay:              cfg.MockDelay.String(),
@@ -333,8 +345,8 @@ func run() int {
 		AuthenticationLatency:  summarizeDurations(submission.AuthTimes),
 		SMTPTransactionLatency: summarizeDurations(submission.TransactionTimes),
 		Delivery:               snapshot,
-		DeliverySeconds:        elapsed.Seconds(),
-		DeliveryRate:           float64(snapshot.Delivered) / max(elapsed.Seconds(), 0.001),
+		BenchmarkSeconds:       elapsed.Seconds(),
+		EndToEndDeliveryRate:   float64(snapshot.Delivered) / max(elapsed.Seconds(), 0.001),
 		EndToEndLatency:        summarizeDurations(latencies),
 		MockSMTP:               mockStats,
 		MockTrafficObserved:    mockTrafficObserved,
@@ -780,7 +792,8 @@ func printReport(report benchmarkReport, submission submissionSummary) {
 	fmt.Printf("Pending:                   %d\n", report.Delivery.Pending)
 	fmt.Printf("Delivering:                %d\n", report.Delivery.Delivering)
 	fmt.Printf("Deferred:                  %d\n", report.Delivery.Deferred)
-	fmt.Printf("End-to-end throughput:     %.2f delivered/sec\n", report.DeliveryRate)
+	fmt.Printf("Benchmark wall time:       %.3f sec\n", report.BenchmarkSeconds)
+	fmt.Printf("End-to-end throughput:     %.2f delivered/sec\n", report.EndToEndDeliveryRate)
 	printLatency("Message stored to delivered", report.EndToEndLatency)
 	fmt.Printf("Delivery completion:       %t\n", report.DeliveryComplete)
 

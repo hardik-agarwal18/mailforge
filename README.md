@@ -18,7 +18,7 @@ It is a **mail-delivery backend**, not a Gmail replacement or hosted mailbox ser
 - Read-only delivery status CLI, Prometheus metrics, Grafana dashboards, and alert rules.
 - Integration coverage for successful delivery, temporary/permanent SMTP failures, retries, duplicate events, ambiguous outcomes, Redis consumer recovery, and DSN suppression.
 
-See [Architecture](docs/architecture.md) for the component flow and [Project scope](docs/project-scope.md) for explicit limitations.
+See [Architecture](docs/architecture.md) for the component flow, [Benchmarking](docs/benchmarking.md) for repeatable performance measurements, and [Project scope](docs/project-scope.md) for explicit limitations.
 
 ## Repository layout
 
@@ -164,7 +164,16 @@ go run ./cmd/smtp-bounce
 
 SMTP submission listens on `127.0.0.1:1587` with the sample `.env`. The local injection listener uses `127.0.0.1:2525`; the bounce receiver defaults to `127.0.0.1:2526`. Metrics listeners are configured separately per process; do not expose metrics endpoints publicly.
 
-For the complete authenticated submission-to-Mailpit smoke test, see [Reliability testing](docs/reliability-testing.md). For message status lookups, see [Delivery status CLI](docs/delivery-status-cli.md).
+For the complete authenticated submission-to-Mailpit smoke test, see [Reliability testing](docs/reliability-testing.md). For message status lookups, see [Delivery status CLI](docs/delivery-status-cli.md). For the final performance matrix, see [Benchmarking](docs/benchmarking.md).
+
+## Automated worker-scaling experiment
+
+On Windows Git Bash, use `./scripts/run-worker-scaling.bash` to run the actual
+delivery-worker concurrency profiles `1`, `3`, and `5` with a fixed submission
+concurrency of `3`. It manages the worker lifecycle and captures benchmark JSON,
+Prometheus metric snapshots, Windows CPU/RAM samples, and Docker stats. See
+[`docs/worker-scaling-automation.md`](docs/worker-scaling-automation.md) for
+preconditions and configuration.
 
 ## Development commands
 
@@ -194,3 +203,4 @@ See [Security](docs/security.md), [Operations](docs/operations.md), and [Project
 ## License
 
 No license file is currently included. Add a license before distributing or accepting external contributions.
+

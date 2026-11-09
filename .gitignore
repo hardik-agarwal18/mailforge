@@ -11,3 +11,7 @@ certs
 *.sh
 
 secrets
+# Generated benchmark JSON/log outputs
+artifacts/benchmarks/
+
+bin/

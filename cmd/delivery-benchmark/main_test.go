@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -99,5 +100,44 @@ func TestWrapBenchmarkBodyDoesNotWrapShortPayload(t *testing.T) {
 	input := strings.Repeat("x", 76)
 	if got := wrapBenchmarkBody(input); got != input {
 		t.Fatalf("wrapBenchmarkBody() = %q, want unchanged payload", got)
+	}
+}
+
+func TestBenchmarkReportContainsReproducibilityMetadata(t *testing.T) {
+	report := benchmarkReport{
+		GoVersion:              "go1.26.8",
+		OperatingSystem:        "windows",
+		Architecture:           "amd64",
+		LogicalCPUCount:        8,
+		AuthenticationParallel: 5,
+		BenchmarkSeconds:       12.5,
+		EndToEndDeliveryRate:   8.0,
+	}
+
+	payload, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal benchmark report: %v", err)
+	}
+
+	var fields map[string]any
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		t.Fatalf("unmarshal benchmark report: %v", err)
+	}
+
+	for _, key := range []string{
+		"go_version",
+		"operating_system",
+		"architecture",
+		"logical_cpu_count",
+		"authentication_parallelism",
+		"benchmark_seconds",
+		"end_to_end_delivered_messages_per_second",
+	} {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("benchmark report is missing %q", key)
+		}
+	}
+	if _, exists := fields["delivery_seconds"]; exists {
+		t.Fatal("benchmark duration must not be labelled as delivery-only seconds")
 	}
 }
